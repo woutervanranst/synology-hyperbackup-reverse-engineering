@@ -76,8 +76,9 @@ public sealed class FileChunkIndex
 
     /// <summary>
     /// Read the chunk list at an exact tier + value offset (the authoritative pointer
-    /// from virtual_file.index). Returns null if the offset does not name a chunk-list
-    /// leaf (e.g. an internal B+-tree node for a file whose list spans several nodes).
+    /// from virtual_file.index). A whole file's chunk list is one flat value here,
+    /// however large (verified on an 8635-chunk / 67 MB file). Returns null if the
+    /// offset does not name a chunk-list value.
     /// </summary>
     public IReadOnlyList<ChunkLocation>? LeafAt(int tier, int valueOffset)
     {

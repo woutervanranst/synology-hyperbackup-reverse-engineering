@@ -34,8 +34,8 @@ public sealed class FileRestorer
                 var run = ResolveChunks(file);
                 if (run is null || run.Count == 0)
                     return FileLocation.None(StorageKind.InlineTag,
-                        "could not resolve the file's chunk list (very large files whose chunk " +
-                        "list spans multiple B+-tree nodes are not yet supported)");
+                        "could not resolve the file's chunk list (a multi-segment chunk list, " +
+                        "seen only for some files in churny multi-version backups)");
                 var blobs = run.Select(c => c.BucketPath).Distinct().OrderBy(p => p, StringComparer.Ordinal).ToList();
                 return new FileLocation(StorageKind.InlineTag, blobs, run, null, null);
             }

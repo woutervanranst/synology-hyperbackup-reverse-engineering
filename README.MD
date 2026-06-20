@@ -211,26 +211,31 @@ Verified working against **real encrypted cloud backups**, and byte-for-byte
 against an unencrypted backup's original source files:
 
 - `list` (including correctly decrypted filenames),
-- `restore` of **single-chunk, multi-chunk, and deduplicated files** — e.g. a 7 MB,
-  875-chunk file and a non-contiguous PDF that reuses chunks internally, both
-  restored MD5-identical to source; on an encrypted backup, a 9.8 MB / 1251-chunk
-  deduplicated file and split-archive parts of *identical size* each restored to
-  their distinct, correct originals (MD5 + size verified on every restore),
+- `restore` of **single-chunk, multi-chunk, large, and deduplicated files** — e.g. a
+  67 MB / 8,635-chunk file and a non-contiguous PDF that reuses chunks internally,
+  both restored MD5-identical to source; on an encrypted backup, a 9.8 MB /
+  1,251-chunk deduplicated file and split-archive parts of *identical size* each
+  restored to their distinct, correct originals (MD5 + size verified on every
+  restore),
 - `archive-plan`, and
 - per-file `rehydrate` (resolves every bucket a file's chunks span).
 
 How a file's chunks are resolved (see [Chunk Manifest](#chunk-manifest)): the
 file's `off_virtual_file` points to its `virtual_file.index` record, which names the
-exact `file_chunk{tier}.index` leaf holding its **ordered chunk list**; each entry
-is resolved through `chunk_index` to a `(bucket, entry)` and thus a physical chunk.
-This is authoritative and handles deduplicated/non-contiguous files and files that
-merely share a size. All of these indexes are plaintext even in encrypted backups.
+exact `file_chunk{tier}.index` leaf holding its **ordered chunk list** (one flat
+value, however long — no size cap), and each entry is resolved through `chunk_index`
+to a `(bucket, entry)` and thus a physical chunk. This is authoritative and handles
+deduplicated/non-contiguous files and files that merely share a size. All of these
+indexes are plaintext even in encrypted backups. Coverage measured on the test data:
+**13/13** files in the unencrypted backup and **2,493/2,494** in the encrypted one.
 
 Remaining gaps:
 
-- **Very large files whose chunk list spans multiple B+-tree nodes** (roughly
-  > 4000 chunks / > 32 MB) are not yet reassembled across nodes; a contiguous-run
-  fallback covers them only when the file happens to be contiguous.
+- **Multi-segment chunk lists.** A few files in *churny multi-version* backups store
+  their chunk list in more than one segment (a `count > 1` field in the
+  `virtual_file.index` record); the second segment is placed non-adjacently and is
+  not yet located. Observed on 1 of 2,494 files in the encrypted backup, 0 in the
+  unencrypted one; the size/contiguous fallbacks recover most such cases.
 - **Tagless `@AppConfig` system files** (e.g. `_Syno_TaskConfig`) are not restored
   (not user data), though their chunk lists are present in the index.
 - The **file-pool internal segmenting** is only partially understood.
@@ -854,7 +859,7 @@ concatenated chunk content-MD5s (for one chunk, `MD5(MD5(content))`). The PoC us
 only as a fallback disambiguator; very large files use a higher-tier hash here that is
 not reproduced. A contiguous-run heuristic (the run of `(bucket_id, offset)`-ordered
 chunks whose `dedup_size`s sum to the file size) is kept as a last resort for files
-absent from the index or whose chunk list spans multiple B+-tree nodes.
+absent from the index or whose chunk list is split into multiple segments.
 
 ### Type 0: B-Tree Paged Index (`Config/virtual_file.index/0.idx.2`)
 
