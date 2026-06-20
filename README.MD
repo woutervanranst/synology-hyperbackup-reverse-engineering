@@ -35,6 +35,7 @@ documented alongside the base format throughout this document.
 12. [Data Recovery Walkthrough](#data-recovery-walkthrough)
 13. [Naming Conventions](#naming-conventions)
 14. [SQLite Database Schemas](#sqlite-database-schemas)
+15. [License](#license)
 
 ---
 
@@ -1255,3 +1256,13 @@ CREATE TABLE vkey (
   ref_count INTEGER NOT NULL DEFAULT 0
 );
 ```
+
+---
+
+## License
+
+This repository is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
+
+The license applies only to the original documentation, analysis, and code in
+this repository. It does not grant any rights to Synology software, trademarks,
+backup data, encryption keys, or other third-party materials.
