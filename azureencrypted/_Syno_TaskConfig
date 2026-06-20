@@ -1,0 +1,37 @@
+[task_config]
+backup_apps=[]
+backup_apps_config=null
+backup_data_type="data"
+backup_filter={}
+backup_folders=[]
+backup_volumes=[]
+compatible_info={"source_hb_version":"4.1.2-4045","source_product":"DSM"}
+create_time=1774900146
+data_compress_type=1
+enable_data_encrypt=true
+enable_delete=true
+enable_notify=true
+enable_version_file_log=false
+enable_version_rotation=false
+enable_xattr=true
+enc_backup_filter="/*eNC00*2reF14Pn1CzbM0+e/70GUCP8noWTJvWQI4+JIuPzcaobSdY=*/"
+enc_backup_folders="/*eNC00*Urc2c9+qLVLe45nP4P6pqPjgVZAwp8QpLmQMmg==*/"
+host_name="synology"
+incheck_info="{\"data_enable\":true,\"date\":\"2026/4/4\",\"time_limit\":0}\n"
+incheck_sched_id=19
+incheck_schedule="{\"schedule\":{\"date\":\"2026/3/30\",\"date_type\":0,\"hour\":22,\"last_work_hour\":22,\"min\":10,\"monthly_week\":[],\"next_trigger_time\":\"2026-04-04 22:10\",\"repeat\":0,\"repeat_hour\":0,\"repeat_hour_store_config\":null,\"repeat_min\":0,\"repeat_min_store_config\":null,\"week_name\":\"6\"}}"
+incheck_schedule_enable=false
+linkkey="synology_001132A9310A_10"
+name="Microsoft Azure 2"
+repo_id=10
+rotate_customized_rules="[[86400,3600,1],[2419200,86400,1],[0,604800,1]]"
+rotate_option="rotate_earliest"
+sched_id=18
+schedule="{\"schedule\":{\"date\":\"2026/3/30\",\"date_type\":0,\"hour\":20,\"last_work_hour\":20,\"min\":10,\"monthly_week\":[],\"next_trigger_time\":\"2026-03-31 20:10\",\"repeat\":0,\"repeat_hour\":0,\"repeat_hour_store_config\":null,\"repeat_min\":0,\"repeat_min_store_config\":null,\"week_name\":\"0,1,2,3,4,5,6\"}}"
+schedule_enable=false
+source_model="DS918+"
+support_cross_file_dedup=true
+target_dir="synology_1.hbk"
+trans_encrypt=true
+unikey="001132A9310A_10_1774900146"
+upload_init_target=true
