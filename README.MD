@@ -79,23 +79,147 @@ tracked across multiple SQLite databases and custom binary index files.
 A working .NET 10 proof-of-concept that reads this format lives in [`src/`](src/):
 
 - **`HyperBackup.Core`** — a storage-agnostic library: SQLite + binary-index
-  parsing, chunk/file-pool restore, AES/RSA/LZ4/XZ crypto, and an
-  Azure-tier-aware archive planner. It runs against either a local folder
+  parsing, chunk/file-pool restore, AES / NaCl sealed-box / LZ4 / XZ crypto, and
+  an Azure-tier-aware archive planner. It runs against either a local folder
   (`LocalDirectoryStorage`) or Azure Blob Storage (`AzureBlobStorage`).
-- **`HyperBackup.Cli`** (`hbk`) — a CLI exposing four capabilities:
-  1. `list` — enumerate every file in a backup version
-  2. `restore` — restore a file's bytes (verified end-to-end on the unencrypted sample)
+- **`HyperBackup.Cli`** (`hbk`) — a CLI exposing four core capabilities:
+  1. `list` — enumerate every file in a backup version (decrypting filenames)
+  2. `restore` — restore a file's bytes (verified end-to-end on the unencrypted
+     sample *and* on a real encrypted Azure backup, for small single-chunk files)
   3. `archive-plan` — decide which blobs can move to the Azure Archive tier
   4. `rehydrate` — determine and rehydrate the exact blob(s) needed for one file
 
+  plus `info`, `demo`, and the raw-blob `ls` / `get` discovery helpers. See
+  [Using the Reference Implementation](#using-the-reference-implementation).
+
 ```bash
-dotnet build HyperBackup.slnx
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll demo --local target-azure-azure-nopassword
+dotnet run --project src/HyperBackup.Cli -- <command> [storage] [options]
 ```
 
-Several corrections in this document — notably the `MD5(MD5(content))` tag and the
-fact that `virtual_file.index` holds metadata (not chunk pointers) — were
-discovered while building and verifying this PoC against the sample backups.
+---
+
+## Using the Reference Implementation
+
+### Requirements & build
+
+Only the **.NET 10 SDK** is required. The tool shells out to nothing — every
+format dependency is a NuGet package: XZ via **SharpCompress**, LZ4 via
+**K4os.Compression.LZ4**, NaCl sealed boxes via **Sodium.Core**, SQLite via
+**Microsoft.Data.Sqlite**, and Azure via **Azure.Storage.Blobs**.
+
+```bash
+dotnet build HyperBackup.slnx
+```
+
+The sandbox can't produce a native apphost, so invoke the built DLL directly
+rather than a `hbk` executable:
+
+```bash
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll <command> [storage] [options]
+```
+
+### Storage selection
+
+Pick exactly one backend:
+
+```bash
+# Local folder on disk
+--local <dir>
+
+# Azure Blob Storage (account + key)
+--azure-account <account> --azure-container <name> [--azure-prefix <prefix>] --azure-key <key>
+
+# Alternative Azure credentials
+--azure-connection-string <cs>   # or env HBK_AZURE_CONNECTION_STRING
+--azure-sas <containerSasUrl>    # or env HBK_AZURE_SAS
+```
+
+Secrets may be supplied via environment variables instead of flags:
+`HBK_AZURE_KEY`, `HBK_AZURE_CONNECTION_STRING`, `HBK_AZURE_SAS`. The
+`--azure-prefix` is the repository folder inside the container (e.g.
+`synology_1.hbk`).
+
+### Encryption
+
+```bash
+--rsa-key <file>        # path to the exported 32-byte X25519 private key
+                        #   (the "..._private.pem" file — raw bytes; for cloud backups)
+--passphrase <p>        # backup passphrase (decrypts local-format encKeys.1); or env HBK_PASSPHRASE
+```
+
+Despite the flag name `--rsa-key`, the file is the raw 32-byte X25519 private
+key (see [Encryption and Compression](#encryption-and-compression)).
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `info` | Show format, encryption/compression flags, key availability, and versions |
+| `list [--version N] [--all]` | List files in a version (decrypts filenames when keys are available); `--all` includes EA-metadata entries |
+| `restore --version N --file <name-or-path> [--out <file>]` | Restore one file's bytes and verify MD5 + size |
+| `archive-plan [--hot-version N ...] [--execute]` | Decide which blobs can move to Azure Archive (keep metadata Hot, archive bulk data); `--execute` performs the tier change |
+| `rehydrate --version N --file <name> [--execute] [--priority high]` | Determine and rehydrate the exact blob(s) one file needs |
+| `demo` | End-to-end showcase on the local sample |
+| `ls [--prefix p] [--limit N]` | Raw blob listing with sizes/tiers (discovery, no parsing) |
+| `get --blob <repo-path> [--offset O --length L] --out <file>` | Download one blob, optionally a byte range |
+
+Examples:
+
+```bash
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll info    --local target-azure-azure-nopassword
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll list    --local target-azure-azure-nopassword
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore --local target-azure-azure-nopassword --version 1 --file test.txt
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll ls      --local target-azure-azure-nopassword --limit 50
+```
+
+### Worked example 1 — local unencrypted sample
+
+```bash
+# Full end-to-end showcase (overview → list → archive-plan → rehydrate → restore)
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll demo --local target-azure-azure-nopassword
+
+# Restore a single file and verify it
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore \
+  --local target-azure-azure-nopassword --version 1 --file test.txt --out restored/test.txt
+```
+
+### Worked example 2 — encrypted Azure backup
+
+Secrets live in a gitignored `secrets/` directory; pass them by path or env so
+they never land in the shell history or this README. Use your own values for
+the `<account>` / `<container>` placeholders.
+
+```bash
+# Inspect the backup (format, encryption, versions, whether keys resolved)
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll info \
+  --azure-account <account> --azure-container <container> --azure-prefix synology_1.hbk \
+  --azure-key "$(cat secrets/azure.key)" \
+  --rsa-key secrets/private.pem
+
+# Restore one file from the encrypted backup
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore \
+  --azure-account <account> --azure-container <container> --azure-prefix synology_1.hbk \
+  --azure-key "$(cat secrets/azure.key)" \
+  --rsa-key secrets/private.pem \
+  --version 1 --file test.txt --out restored/test.txt
+```
+
+### Status / limitations
+
+Verified working against **real encrypted cloud backups**:
+
+- `list` (including correctly decrypted filenames),
+- `restore` of small single-chunk files (MD5 + size verified),
+- `archive-plan`, and
+- per-file `rehydrate`.
+
+Not yet working:
+
+- **Large, multi-chunk files** are not restorable — the per-file *ordered chunk
+  manifest* (which chunks, in which order, across which buckets) is still being
+  reverse-engineered.
+- The **file-pool internal segmenting** (header fields at `0x100`–`0x14C`) is
+  only partially understood, so file-pool blobs do not fully restore.
 
 ---
 
@@ -187,9 +311,9 @@ When encryption is enabled, two additional files appear:
 ```
   Config/
     encKeys.1                           # 16-byte header (no key material in cloud format)
-    public.pem.1                        # 32-byte RSA public key fingerprint
+    public.pem.1                        # 32-byte X25519 public key (raw, not PEM text)
   Pool/
-    vkey.db.2                           # SQLite: RSA-encrypted per-version keys
+    vkey.db.2                           # SQLite: sealed-box-wrapped per-version keys
 ```
 
 All other files exist in the same paths with the same structure.
@@ -869,9 +993,10 @@ Three files appear only when encryption is enabled:
 
 #### `Config/encKeys.1` (16 bytes)
 
-Header-only file. In local HyperBackup, this file stores the AES-encrypted
-RSA private key. In cloud format, only the header is present -- the RSA
-private key is **not** stored in the cloud backup.
+Header-only file. In local HyperBackup, this file additionally stores the
+32-byte X25519 private key, AES-256-CBC-encrypted with the password key. In
+cloud format, only the 16-byte header is present -- the X25519 private key is
+**not** stored in the cloud backup and must be exported from the NAS separately.
 
 ```
 Offset  Hex                               ASCII
@@ -888,19 +1013,24 @@ Offset  Hex                               ASCII
 
 #### `Config/public.pem.1` (32 bytes)
 
-Binary blob -- NOT a PEM-format file despite the name. Contains 32 bytes of
-opaque data, likely a hash or fingerprint of the RSA public key used for
-key wrapping. Not a usable public key on its own.
+Binary blob -- NOT a PEM-format file despite the name. It is the **32-byte
+X25519 public key** used by the NaCl sealed boxes that wrap each version key.
+Verified: `X25519(exported_private_key) == public.pem.1`. The matching 32-byte
+X25519 private key is what the NAS exports as `Microsoft Azure 1_private.pem`
+(also raw bytes, not PEM text).
 
 #### `Pool/vkey.db.2` (SQLite -- Version Key Database)
 
-Stores per-version encryption keys, RSA-encrypted with the backup's public key.
+Stores per-version encryption keys, each wrapped in a NaCl `crypto_box_seal`
+(libsodium *sealed box*) against the backup's 32-byte X25519 public key. The
+column names contain `rsa_` for historical reasons, but the contents are sealed
+boxes, **not** RSA.
 
 ```sql
 CREATE TABLE vkey (
     version_id INTEGER PRIMARY KEY,
-    rsa_vkey BLOB NOT NULL,        -- RSA-encrypted AES key (80 bytes)
-    rsa_vkey_iv BLOB,              -- RSA-encrypted AES IV (64 bytes)
+    rsa_vkey BLOB NOT NULL,        -- sealed_box(file_key)  (80 bytes)
+    rsa_vkey_iv BLOB,              -- sealed_box(file_iv)   (64 bytes)
     checksum BLOB,                 -- MD5 integrity check (16 bytes)
     ref_count INTEGER NOT NULL DEFAULT 0
 );
@@ -911,10 +1041,19 @@ Example row:
 | Field | Size | Description |
 |-------|------|-------------|
 | `version_id` | — | `1` |
-| `rsa_vkey` | 80 bytes | Version AES-256 key, encrypted with RSA-640 (PKCS1 v1.5) |
-| `rsa_vkey_iv` | 64 bytes | Version AES IV, encrypted with RSA-512 (PKCS1 v1.5) |
+| `rsa_vkey` | 80 bytes | `crypto_box_seal(file_key)`; the 32-byte AES-256 key sealed = 32 (ephemeral pubkey) + 32 (ciphertext) + 16 (Poly1305 MAC) |
+| `rsa_vkey_iv` | 64 bytes | `crypto_box_seal(file_iv)`; the 16-byte AES IV sealed = 32 (ephemeral pubkey) + 16 (ciphertext) + 16 (Poly1305 MAC) |
 | `checksum` | 16 bytes | `MD5(rsa_vkey + fileKeySalt + rsa_vkey_iv)` |
 | `ref_count` | — | `3` (number of buckets using this version key) |
+
+To recover the version key, open each sealed box with the X25519 key pair:
+
+```
+file_key = crypto_box_seal_open(rsa_vkey,    x25519_pub, x25519_priv)  -> 32 bytes
+file_iv  = crypto_box_seal_open(rsa_vkey_iv, x25519_pub, x25519_priv)  -> 16 bytes
+```
+
+A wrong key fails the Poly1305 MAC, so an incorrect key is detected immediately.
 
 ### Encryption Key Hierarchy
 
@@ -934,37 +1073,40 @@ fileKeySalt   = "8Llx6OSaDPzbwCkjG8eYc64GZGMIlMXm"
 password_key = SHA256(passwordSalt + password)     → 32 bytes (AES-256 key)
 ```
 
-Used to decrypt the RSA private key (in local backups where it is stored).
+Used **only in local backups** to decrypt the stored X25519 private key. It is
+useless on its own for cloud backups (see Layer 2).
 
-#### Layer 2: RSA Key Pair
+#### Layer 2: X25519 Key Pair
 
-An RSA key pair is generated when the encrypted backup task is created.
-The **public key** encrypts per-version keys during backup. The **private
-key** is needed for decryption.
+An X25519 (Curve25519) key pair is generated when the encrypted backup task is
+created. The **public key** (`Config/public.pem.1`, 32 raw bytes) seals each
+per-version key with NaCl `crypto_box_seal` during backup. The matching 32-byte
+**private key** is needed for decryption.
 
-In local HyperBackup format, the RSA private key is stored in `encKeys.1`,
-encrypted with the password key:
+In local HyperBackup format, the 32-byte X25519 private key is stored in
+`encKeys.1`, AES-256-CBC-encrypted with the password key:
 
 ```
-rsa_private_key = AES-256-CBC-decrypt(
+x25519_private_key = AES-256-CBC-decrypt(
     key  = password_key,
     iv   = MD5(unikey + unikeySalt1),
     data = encKeys.1 payload
 )
 ```
 
-**In cloud format, `encKeys.1` contains only the 16-byte header.** The RSA
-private key must be exported from the NAS separately. Without it, cloud-only
-recovery is impossible -- the password alone is not sufficient.
+**In cloud format, `encKeys.1` contains only the 16-byte header.** The X25519
+private key must be exported from the NAS separately (the
+`Microsoft Azure 1_private.pem` file — 32 raw bytes despite the name). Without
+it, cloud-only recovery is impossible -- the password alone is not sufficient.
 
 #### Layer 3: Version Keys (Per-Version AES Key + IV)
 
-Each backup version has its own AES key and IV, stored RSA-encrypted in
-`Pool/vkey.db.2`:
+Each backup version has its own AES key and IV, stored as NaCl sealed boxes in
+`Pool/vkey.db.2`. Open them with the X25519 key pair:
 
 ```
-file_key = RSA-decrypt(rsa_private_key, rsa_vkey)    → 32 bytes
-file_iv  = RSA-decrypt(rsa_private_key, rsa_vkey_iv) → 16 bytes
+file_key = crypto_box_seal_open(rsa_vkey,    x25519_pub, x25519_priv)  → 32 bytes
+file_iv  = crypto_box_seal_open(rsa_vkey_iv, x25519_pub, x25519_priv)  → 16 bytes
 ```
 
 The checksum is verified:
@@ -974,18 +1116,21 @@ assert expected == checksum column
 ```
 
 These `file_key` / `file_iv` values are the actual AES-256-CBC parameters
-used to encrypt/decrypt chunk data in buckets.
+used to encrypt/decrypt chunk data in buckets. (A wrong X25519 key already
+fails the sealed box's Poly1305 MAC before the checksum is even reached.)
 
 #### Layer 4: Filename Encryption Key
 
 Filenames use a separate key derivation:
 
 ```
-filename_key = SHA256(rsa_private_key_bytes + unikey)    → 32 bytes
-filename_iv  = MD5(unikey + unikeySalt2)                 → 16 bytes
+filename_key = SHA256(x25519_private_key_bytes + unikey)    → 32 bytes
+filename_iv  = MD5(unikey + unikeySalt2)                     → 16 bytes
 ```
 
-Where `unikey` is from `_Syno_TaskConfig` (e.g., `001132A9310A_10_1774900146`).
+Where `x25519_private_key_bytes` is the same 32-byte X25519 private key from
+Layer 2, and `unikey` is from `_Syno_TaskConfig`
+(e.g., `001132A9310A_10_1774900146`).
 
 ### Filename Encryption
 
@@ -1091,16 +1236,16 @@ decryption key is correct before attempting full data recovery.
 
 ### Cloud Format Limitation
 
-**Critical**: Full decryption of a cloud-format encrypted backup requires
-both:
+**Critical**: Full decryption of a cloud-format encrypted backup requires the
+**32-byte X25519 private key** exported from the NAS (the
+`Microsoft Azure 1_private.pem` file — raw bytes, not PEM text). This single key
+is sufficient: it opens the per-version sealed boxes and derives the filename
+key.
 
-1. The **user password** (to derive the password key)
-2. The **RSA private key** exported from the NAS (or from a local backup's
-   `encKeys.1` file)
-
-The password alone is NOT sufficient for cloud-only recovery. The cloud
-`encKeys.1` file contains only a 16-byte header with no key material. Users
-must separately export and preserve the encryption key from the NAS
+The **password alone is NOT sufficient** for cloud-only recovery. In a *local*
+backup the password decrypts `encKeys.1` to recover the X25519 private key, but
+the cloud `encKeys.1` file contains only a 16-byte header with no key material.
+Users must separately export and preserve the encryption key from the NAS
 management interface.
 
 ---
@@ -1119,38 +1264,44 @@ SELECT info_value FROM backup_info_tb WHERE info_name = 'dataComp';
 -- 'T' = compressed, 'F' = uncompressed
 ```
 
-If encrypted, you need both the **password** and the **RSA private key**
-(exported from the NAS or from a local backup's `encKeys.1`).
+If encrypted, you need the **32-byte X25519 private key** exported from the NAS
+(`Microsoft Azure 1_private.pem`). For a *local* backup you can instead supply
+the **password**, which decrypts that same key out of `encKeys.1`; for a *cloud*
+backup the password is not enough and the exported key is required.
 
 ### Step 2: Derive Decryption Keys (Encrypted Only)
 
 ```python
 import hashlib
-from Crypto.PublicKey import RSA
-from Crypto.Cipher import AES, PKCS1_v1_5
+from Crypto.Cipher import AES               # PyCryptodome (AES only)
+from nacl.public import PrivateKey, SealedBox
 
 password_salt = b"5mNgudh053SUoMrZxoKG8GUWyj6kEtGO"
 unikey_salt1  = b"CIpfMargmxetgFtkBmG3KqEiQ6qfqZgF"
 unikey_salt2  = b"kkE7sRZRvnbVlJFofhD7WCXumXBGyzki"
 file_key_salt = b"8Llx6OSaDPzbwCkjG8eYc64GZGMIlMXm"
 
-# Derive password key
-password_key = hashlib.sha256(password_salt + password.encode()).digest()
-
-# Decrypt RSA private key (from local encKeys.1 or NAS export)
 unikey = b"..."  # from _Syno_TaskConfig
-rsa_iv = hashlib.md5(unikey + unikey_salt1).digest()
-cipher = AES.new(password_key, AES.MODE_CBC, rsa_iv)
-rsa_private_key = cipher.decrypt(encrypted_rsa_key)  # strip PKCS7 padding
 
-# Decrypt version keys from vkey.db
-rsa_key = RSA.import_key(rsa_private_key)
-sentinel = b'\x00' * 32
-file_key = PKCS1_v1_5.new(rsa_key).decrypt(rsa_vkey, sentinel)   # 32 bytes
-file_iv  = PKCS1_v1_5.new(rsa_key).decrypt(rsa_vkey_iv, sentinel) # 16 bytes
+# Obtain the 32-byte X25519 PRIVATE key:
+#   cloud backup  -> read it straight from the exported "..._private.pem"
+#                    (it is 32 raw bytes, NOT PEM text)
+# x25519_private_bytes = open("Microsoft Azure 1_private.pem", "rb").read()
+#
+#   local backup  -> decrypt it out of encKeys.1 with the password key
+# password_key = hashlib.sha256(password_salt + password.encode()).digest()
+# kdf_iv = hashlib.md5(unikey + unikey_salt1).digest()
+# x25519_private_bytes = AES.new(password_key, AES.MODE_CBC, kdf_iv) \
+#                           .decrypt(enckeys_payload)   # then strip PKCS7
+x25519_private_bytes = b"..."  # 32 bytes, from one of the two paths above
 
-# Derive filename decryption key
-filename_key = hashlib.sha256(rsa_private_key + unikey).digest()
+# Open the per-version sealed boxes (NaCl crypto_box_seal). A wrong key raises.
+box      = SealedBox(PrivateKey(x25519_private_bytes))
+file_key = box.decrypt(rsa_vkey)      # 32 bytes — AES-256 key
+file_iv  = box.decrypt(rsa_vkey_iv)   # 16 bytes — AES IV
+
+# Derive filename decryption key (note: the X25519 private key bytes, NOT RSA)
+filename_key = hashlib.sha256(x25519_private_bytes + unikey).digest()
 filename_iv  = hashlib.md5(unikey + unikey_salt2).digest()
 ```
 
@@ -1346,8 +1497,8 @@ CREATE TABLE file_pool_map (
 ```sql
 CREATE TABLE vkey (
   version_id INTEGER PRIMARY KEY,
-  rsa_vkey BLOB NOT NULL,          -- RSA-encrypted AES key (80 bytes)
-  rsa_vkey_iv BLOB,                -- RSA-encrypted AES IV (64 bytes)
+  rsa_vkey BLOB NOT NULL,          -- sealed_box(file_key), 80 bytes (NaCl, not RSA)
+  rsa_vkey_iv BLOB,                -- sealed_box(file_iv),  64 bytes (NaCl, not RSA)
   checksum BLOB,                   -- MD5 integrity check (16 bytes)
   ref_count INTEGER NOT NULL DEFAULT 0
 );

@@ -10,8 +10,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <!-- Sandbox FS cannot create/codesign the native apphost; run via `dotnet <dll>`. -->
-    <UseAppHost>false</UseAppHost>
     <AssemblyName>hbk</AssemblyName>
     <RootNamespace>HyperBackup.Cli</RootNamespace>
   </PropertyGroup>
