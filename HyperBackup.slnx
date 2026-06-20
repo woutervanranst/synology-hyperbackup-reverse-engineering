@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/HyperBackup.Cli/HyperBackup.Cli.csproj" />
+    <Project Path="src/HyperBackup.Core/HyperBackup.Core.csproj" />
+  </Folder>
+</Solution>

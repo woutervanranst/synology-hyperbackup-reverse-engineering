@@ -56,9 +56,10 @@ tracked across multiple SQLite databases and custom binary index files.
 - **Two-tier storage**: Small files (<=1024 bytes by default) are stored as chunks
   in buckets. Large files go to a separate file pool as XZ-compressed blobs.
 - **Cloud-aware**: Guard databases track upload state for resumable transfers.
-- **Optional encryption**: AES-256-CBC with RSA key wrapping. Encrypts chunk
-  data, filenames, and config values while leaving SQLite schemas/structure in
-  the clear.
+- **Optional encryption**: AES-256-CBC for data, with per-version keys wrapped by
+  NaCl `crypto_box_seal` (X25519 sealed boxes — *not* RSA; see the correction in
+  [Encryption and Compression](#encryption-and-compression)). Encrypts chunk data,
+  filenames, and config values while leaving SQLite schemas/structure in the clear.
 - **Optional compression**: LZ4 block compression applied before encryption.
 
 ### Format Identifiers
@@ -70,6 +71,31 @@ tracked across multiple SQLite databases and custom binary index files.
 | `bkpType` | `cloud` |
 | Index format | `{"major":0,"minor":9,"sub_minor":1}` |
 | Target format | `{"major":0,"minor":3,"sub_minor":0}` |
+
+---
+
+## Reference Implementation (PoC)
+
+A working .NET 10 proof-of-concept that reads this format lives in [`src/`](src/):
+
+- **`HyperBackup.Core`** — a storage-agnostic library: SQLite + binary-index
+  parsing, chunk/file-pool restore, AES/RSA/LZ4/XZ crypto, and an
+  Azure-tier-aware archive planner. It runs against either a local folder
+  (`LocalDirectoryStorage`) or Azure Blob Storage (`AzureBlobStorage`).
+- **`HyperBackup.Cli`** (`hbk`) — a CLI exposing four capabilities:
+  1. `list` — enumerate every file in a backup version
+  2. `restore` — restore a file's bytes (verified end-to-end on the unencrypted sample)
+  3. `archive-plan` — decide which blobs can move to the Azure Archive tier
+  4. `rehydrate` — determine and rehydrate the exact blob(s) needed for one file
+
+```bash
+dotnet build HyperBackup.slnx
+dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll demo --local target-azure-azure-nopassword
+```
+
+Several corrections in this document — notably the `MD5(MD5(content))` tag and the
+fact that `virtual_file.index` holds metadata (not chunk pointers) — were
+discovered while building and verifying this PoC against the sample backups.
 
 ---
 
@@ -360,7 +386,7 @@ CREATE TABLE version_list (
   version_id INTEGER,            -- Which backup version
   status TEXT,                   -- Entry status
   inode INTEGER,                 -- Source filesystem inode
-  tag BLOB,                      -- 20 bytes: MD5(16) + size_BE(4)
+  tag BLOB,                      -- 20 bytes: MD5(MD5(content))(16) + size_BE(4)
   cr_time INTEGER,               -- Creation time
   nlink INTEGER,                 -- Hard link count
   fs_id INTEGER,                 -- References file_system_list
@@ -390,33 +416,57 @@ references. The root sentinel is:
 
 #### Tag System (Inline Small File Storage)
 
-Files at or below `tag_db_file_size_thr` (1024 bytes) get a 20-byte `tag` blob:
+Files at or below `tag_db_file_size_thr` (1024 bytes) in user shares get a
+20-byte `tag` blob that acts as the chunk locator:
 
 ```
-Bytes 0-15:  MD5 checksum of file content
+Bytes 0-15:  MD5(MD5(content))   -- the double-MD5 dedup key (NOT the raw content MD5)
 Bytes 16-19: File size (big-endian uint32)
 ```
 
-Examples from the Video share:
+> **Correction (verified by the reference implementation in `src/`):** the first
+> 16 bytes are **not** `MD5(content)`. They are `MD5` applied to the content's MD5,
+> i.e. `MD5(MD5(content))`. The bucket index
+> ([Type 2](#type-2-bucket-chunk-index-pool00index2)) stores the *content* MD5; to
+> locate a file's chunk, compute `MD5(content_md5)` for each bucket-index entry and
+> match it against the file's `tag[0:16]`. Because the bucket-index MD5 is always
+> stored in the clear, this lookup also works for encrypted backups.
 
-| File | MD5 (hex) | Size |
-|------|-----------|------|
-| `test.txt` | `62109206880D38A4010A98E11243924A` | 5 |
-| `test2.txt` | `6B1A0A0FFC1AA4313A9532C3D848B7A8` | 5 |
-| `test.txt@SynoEAStream` | `C29A43B6150CE2E0BC180E48915E3D34` | 408 |
-| `dir@SynoEAStream` | `78047B2E8DB0ABC675EB248CC2BAF67E` | 163 |
+Examples from the Video share (`tag` field shown = `MD5(MD5(content))`):
 
-Files without tags (directories) have `tag = NULL`.
+| File | `tag[0:16]` = MD5(MD5(content)) | content MD5 (in bucket index) | Size |
+|------|--------------------------------|-------------------------------|------|
+| `test.txt` | `62109206880D38A4010A98E11243924A` | `5D41402ABC4B2A76B9719D911017C592` (`md5("hello")`) | 5 |
+| `test2.txt` | `6B1A0A0FFC1AA4313A9532C3D848B7A8` | `7D793037A0760186574B0282F2F435E7` (`md5("world")`) | 5 |
+| `dir@SynoEAStream` | `78047B2E8DB0ABC675EB248CC2BAF67E` | `157B2B8B4D1D043832653A98F1ED6BF4` | 163 |
+
+Files without tags (directories) have `tag = NULL`. Files in the `@AppConfig`
+system share also have `tag = NULL` even when small (e.g. `_Syno_TaskConfig`,
+891 bytes); their content is located through the `file_chunk{1..4}.index` tiers
+(layout not fully reverse-engineered) rather than an inline tag.
 
 Files above the threshold (like `config.dss` at 55,292 bytes) have
 `off_virtual_file = -1` and are stored in the file pool instead.
 
+> **Large / multi-chunk files (observed in real backups):** the included sample
+> only contains tiny single-chunk files and one file-pool file. In a real backup,
+> `.bucket.2` files are filled to a fixed capacity (~50 MiB; e.g. 52,432,240 bytes
+> each), so a large file is split into many chunks that span **multiple buckets**.
+> Restoring such a file means reading its ordered chunk list and **concatenating**
+> the chunks across buckets. The per-file ordered chunk list lives in the
+> `virtual_file.index` / `file_chunk*.index` structures (exact layout still under
+> investigation against a real multi-version backup).
+
 #### `off_virtual_file` Field
 
 This integer is an offset into the virtual file index
-(`Config/virtual_file.index/0.idx.2`), which maps logical file positions to
-physical chunk locations in the Pool. Directories also have offsets (pointing to
-directory metadata entries).
+(`Config/virtual_file.index/0.idx.2`). **Correction:** for the small single-chunk
+files in the sample, the record at that offset is per-entry *metadata* only — node
+id, parent id, uid/gid, create/modify timestamps (sec + nsec), permissions, and a
+trailing checksum — and does **not** itself contain the chunk bytes' location;
+those files are located via the `tag`. For large multi-chunk files the same index
+is believed to carry the file's ordered chunk list (see the note above). A value
+of `-1` is the sentinel meaning "stored in the file pool".
 
 #### Entry Types in `version_list`
 
@@ -587,10 +637,11 @@ magic bytes `7053 a86e`. All multi-byte integers are **big-endian**.
 Maps chunks within a single `.bucket.2` file. Used to locate and verify
 individual chunks.
 
-Data starts at offset `0x20`. Entry 0 is a meta-entry (8 bytes of metadata +
-CRC). Entries 1..N describe actual chunks.
+The 60-byte common header is followed by a 32-byte meta region (`0x20`–`0x3F`).
+**Actual chunk entries begin at offset `0x40`** and are 32 bytes each; the entry
+count is `(file_size - 0x40) / 32`. (Verified by the reference implementation.)
 
-**Chunk Entry (32 bytes each):**
+**Chunk Entry (32 bytes each, starting at `0x40`):**
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -623,8 +674,13 @@ locations (bucket ID + offset).
 
 ### Type 0: B-Tree Paged Index (`Config/virtual_file.index/0.idx.2`)
 
-A B-tree index of the virtual filesystem. Maps file/directory metadata with
-timestamps, permissions, sizes, and pointers to chunk data.
+A B-tree index of the virtual filesystem. In the sample, each leaf entry holds
+file/directory **metadata** — node id, parent id, uid/gid, create/modify
+timestamps (sec + nsec), permissions, and a trailing checksum. The original claim
+that it stores "pointers to chunk data" is not borne out for single-chunk files
+(which are located via the `tag`); for large multi-chunk files this index is
+believed to carry the file's ordered chunk list, but that layout has not yet been
+confirmed against a real backup.
 
 **Header specifics:**
 - `format_type=0`, `tree_depth=2`
@@ -675,11 +731,13 @@ Large files stored in `Pool/file_pool/{id}.file.2` use this format:
 | `0x100` | ~76 | Metadata block |
 | `0x14C` | var | XZ-compressed payload |
 
-The payload in our test backup is an XZ-compressed **tar archive** (ustar
-format) containing `ConfigBkp/_Syno_ConfBkp.db` -- the Synology configuration
-backup database.
+The payload in our test backup is an XZ-compressed **GNU tar archive**
+containing `ConfigBkp/_Syno_ConfBkp.db` -- the Synology configuration backup
+database. Observed header fields just before the payload: a CRC32-like value at
+`0x13C` and two little-endian 32-bit sizes at `0x144`/`0x148`.
 
-To extract:
+To extract (note: in the bundled sample this stream is truncated/corrupt, so
+`xz` exits non-zero after emitting partial output):
 ```bash
 # Skip the 0x14C (332) byte header, decompress with xz
 dd if=1.file.2 bs=1 skip=332 | xz -d > output.tar
@@ -761,6 +819,32 @@ encryption to chunk data, filenames, and certain config values. The repository
 structure remains identical -- all SQLite databases, binary index files, JSON
 configs, and counters exist in the same paths with the same schemas. Only the
 **content** of certain fields changes.
+
+> [!IMPORTANT]
+> **Major correction (verified by the reference implementation against a real
+> encrypted cloud backup + the exported key):** the per-version keys are **not**
+> RSA-wrapped. They use **NaCl `crypto_box_seal`** — libsodium *sealed boxes*
+> (Curve25519/X25519 + XSalsa20-Poly1305). The "encryption key" Synology exports
+> (e.g. `Microsoft Azure 1_private.pem`) is a **32-byte X25519 private key** (raw
+> bytes, despite the `.pem` name), and `public.pem.1` is the matching 32-byte
+> X25519 public key (`X25519(private) == public.pem.1`, confirmed). The `vkey`
+> blob sizes are the giveaway: `sealed_box(32-byte key)` = 32 (ephemeral pk) + 32
+> (ciphertext) + 16 (MAC) = **80 bytes**; `sealed_box(16-byte IV)` = 32 + 16 + 16
+> = **64 bytes**. Decryption:
+> ```
+> file_key = crypto_box_seal_open(vkey.rsa_vkey)      -> 32-byte AES-256 key
+> file_iv  = crypto_box_seal_open(vkey.rsa_vkey_iv)   -> 16-byte AES IV
+> ```
+> The exported X25519 key is **required** for cloud backups and is **not**
+> derivable from the password (the password only ever decrypts the *local*
+> `encKeys.1`, which is empty in the cloud). The full content pipeline, verified
+> end-to-end on real data:
+> `crypto_box_seal_open` → **AES-256-CBC** (PKCS7) → **LZ4 block** decompress to
+> `dedup_size` (small/incompressible chunks are stored *uncompressed* — detect by
+> `unpadded_len == dedup_size`) → MD5 matches the bucket index. Filenames decrypt
+> with `key = SHA256(x25519_private || unikey)`, `iv = MD5(unikey || unikeySalt2)`,
+> AES-256-CBC, base64(`+_`) — also confirmed. The "RSA-640/RSA-512/PKCS1" wording
+> below is the original (incorrect) guess, kept for context.
 
 ### What Is Encrypted vs. Plaintext
 
@@ -1103,15 +1187,19 @@ plaintext = plaintext[:-pad_len].decode('utf-8')
 
 ### Step 5: Recover Small Files (tag != NULL, size <= threshold)
 
-The `tag` blob contains the MD5 hash (bytes 0-15) and size (bytes 16-19).
-Use the MD5 to find the chunk in bucket indexes:
+The `tag` blob holds `MD5(MD5(content))` (bytes 0-15) and the size (bytes 16-19).
+The bucket index stores the *content* MD5, so match on the double-MD5:
 
 ```
 For each Pool/0/0/{N}.index.2:
-  Parse chunk entries (32 bytes each starting at offset 0x40)
-  Match MD5 hash from tag against entry bytes 12-27
-  Read chunk_size bytes at bucket_offset from {N}.bucket.2
+  Parse chunk entries (32 bytes each, starting at offset 0x40)
+  For each entry, compute MD5(entry.md5)   # entry.md5 (bytes 12-27) = content MD5
+  If MD5(entry.md5) == tag[0:16]:
+    Read chunk_size bytes at bucket_offset from {N}.bucket.2   # = the content
 ```
+
+Verify: `MD5(content)` must equal the entry's content MD5, and
+`MD5(MD5(content))` must equal `tag[0:16]`.
 
 **If encrypted**: Read `chunk_size + 4` bytes from the bucket (the extra
 4 bytes are the integrity tag). Decrypt the first `chunk_size` bytes with
@@ -1121,9 +1209,17 @@ length header).
 
 ### Step 6: Recover Large Files (off_virtual_file == -1, tag == NULL)
 
-Look up the file in `Pool/file_pool/file_pool_map.db.2` by its checksum.
-The `id` maps to `Pool/file_pool/{id}.file.2`. Skip the header (offset
-0x14C) and decompress with XZ/LZMA.
+Large files live in the file pool: `Pool/file_pool/{id}.file.2`. Skip the
+0x14C-byte header (the XZ magic `FD 37 7A 58 5A 00` begins there) and decompress
+with XZ/LZMA; the result is a GNU `tar` archive holding the file.
+
+> **Caveats (observed in the sample):** the file→`id` mapping is not stored in any
+> `version_list` field for large files (`tag` and `disk_entry_tag` are both NULL),
+> and `file_pool_map.checksum` does **not** equal `MD5(content)` or
+> `MD5(MD5(content))` of the decompressed output. In the included sample,
+> `config.dss`'s XZ payload is truncated/corrupt (`xz` reports *"Compressed data is
+> corrupt"*), so it does not fully restore. The file-pool internal segment format
+> (header fields at `0x100`–`0x14C`) is only partially reverse-engineered.
 
 ### Step 7: Skip Metadata Entries
 

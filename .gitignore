@@ -1,0 +1,15 @@
+# .NET build artifacts
+bin/
+obj/
+.nuget-packages/
+
+# Local secrets (Azure credentials) - never commit
+secrets/
+*.local.json
+.env
+
+# Restore output
+restored/
+
+# OS
+.DS_Store
