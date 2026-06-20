@@ -38,19 +38,12 @@ public sealed partial class RepoPaths
         return suffix.Length > 0 && suffix.All(char.IsDigit);
     }
 
-    public IEnumerable<string> BucketIndexes() => _all.Where(IsBucketIndex);
-
-    public static string BucketDataForIndex(string indexPath) =>
-        indexPath.Replace(".index.", ".bucket.");
-
-    // Generation-agnostic classifiers (suffix ".N" where N is digits).
-    public static bool IsBucketIndex(string p) => BucketIndexRx().IsMatch(p);
+    // Generation-agnostic data-blob classifiers (trailing ".N" where N is digits).
     public static bool IsBucketData(string p) => BucketDataRx().IsMatch(p);
     public static bool IsFilePoolBlob(string p) =>
         p.StartsWith("Pool/file_pool/", StringComparison.Ordinal) && FilePoolRx().IsMatch(p);
     public static bool IsDataBlob(string p) => IsBucketData(p) || IsFilePoolBlob(p);
 
-    [GeneratedRegex(@"(^|/)\d+\.index\.\d+$")] private static partial Regex BucketIndexRx();
     [GeneratedRegex(@"(^|/)\d+\.bucket\.\d+$")] private static partial Regex BucketDataRx();
     [GeneratedRegex(@"(^|/)\d+\.file\.\d+$")] private static partial Regex FilePoolRx();
 }

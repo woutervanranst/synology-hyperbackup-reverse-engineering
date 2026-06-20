@@ -43,8 +43,6 @@ public sealed class HyperBackupKeys
         _publicKey = publicKey;
     }
 
-    public byte[] PublicKey => _publicKey;
-
     public static byte[] DerivePasswordKey(string password) =>
         SHA256.HashData([.. PasswordSalt, .. Encoding.UTF8.GetBytes(password)]);
 

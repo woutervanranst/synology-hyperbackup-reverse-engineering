@@ -11,5 +11,8 @@ secrets/
 # Restore output
 restored/
 
+# Local access-tier simulation sidecar (written by the local storage backend)
+.hbk-tierstate.json
+
 # OS
 .DS_Store

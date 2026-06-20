@@ -19,7 +19,6 @@ public static class CommandRunner
             {
                 case "ls": return Ls(args);
                 case "get": return Get(args);
-                case "keytest": return KeyTest(args);
                 case "info": return Info(args);
                 case "list": return List(args);
                 case "restore": return Restore(args);
@@ -151,23 +150,6 @@ public static class CommandRunner
         return 0;
     }
 
-    private static int KeyTest(Args args)
-    {
-        var repo = BuildRepo(args);
-        var keys = repo.RequireKeys();
-        Console.WriteLine("derived public key: " + Convert.ToHexString(keys.PublicKey).ToLowerInvariant());
-        foreach (var v in repo.ListVersions())
-        {
-            try
-            {
-                var vk = repo.GetVersionKey(v.Id);
-                Console.WriteLine($"v{v.Id}: file_key={Convert.ToHexString(vk.FileKey).ToLowerInvariant()} file_iv={Convert.ToHexString(vk.FileIv).ToLowerInvariant()}");
-            }
-            catch (Exception ex) { Console.WriteLine($"v{v.Id}: {ex.Message}"); }
-        }
-        return 0;
-    }
-
     private static int Info(Args args)
     {
         var repo = BuildRepo(args);
@@ -219,7 +201,7 @@ public static class CommandRunner
         var entry = FindFile(repo, version, fileArg);
 
         var restorer = new FileRestorer(repo);
-        var bytes = restorer.Restore(version, entry);
+        var bytes = restorer.Restore(entry);
 
         var outPath = args.Get("out") ?? Path.Combine("restored", Path.GetFileName(entry.Name));
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
@@ -355,7 +337,7 @@ public static class CommandRunner
         Rule("4) RESTORE BLOCKED — chunk is in Archive");
         try
         {
-            restorer.Restore(version.Id, target);
+            restorer.Restore(target);
             Console.WriteLine("  (unexpected: restore succeeded though data was archived)");
         }
         catch (BlobArchivedException ex)
@@ -370,7 +352,7 @@ public static class CommandRunner
         planner.ExecuteRehydration(rplan, AccessTier.Hot);
         Console.WriteLine("  [executed] rehydrated the required blob(s).");
 
-        var bytes = restorer.Restore(version.Id, target);
+        var bytes = restorer.Restore(target);
         Console.WriteLine($"  restored {bytes.Length} bytes; md5={Convert.ToHexString(System.Security.Cryptography.MD5.HashData(bytes)).ToLowerInvariant()}");
         if (TryPreview(bytes, out var preview))
             Console.WriteLine($"  content: {preview}");

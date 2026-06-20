@@ -209,7 +209,7 @@ public sealed class BackupRepository
     }
 
     /// <summary>Unwrap the per-version AES key/IV (encrypted repos only).</summary>
-    public VersionKey GetVersionKey(int versionId)
+    private VersionKey GetVersionKey(int versionId)
     {
         var keys = RequireKeys();
         using var conn = SqliteStore.OpenReadOnly(Storage, Paths.Require("Pool/vkey.db"));

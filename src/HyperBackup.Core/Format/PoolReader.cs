@@ -6,21 +6,33 @@ namespace HyperBackup.Core.Format;
 /// <summary>Where a chunk physically lives: which bucket blob and where inside it.</summary>
 public sealed record ChunkLocation(string BucketPath, ChunkEntry Entry);
 
+/// <summary>One chunk in global write order, with the values needed to resolve files.</summary>
+public sealed record OrderedChunk(ChunkLocation Location, uint DedupSize, byte[] Md5);
+
 /// <summary>
-/// Indexes all bucket chunks in the Pool and resolves a content MD5 to its
-/// physical location, so a chunk can be read (and the owning blob identified for
-/// archive/rehydrate decisions).
+/// Reads the Pool's chunk store and resolves a file to its ordered list of chunks.
 ///
-/// Buckets live as paired files "{N}.bucket.2" + "{N}.index.2" under "Pool/"
-/// (typically "Pool/0/0/"). We enumerate every ".index.2" beneath Pool/ so the
-/// reader works regardless of the group/subgroup layout.
+/// Reverse-engineered model (verified against plaintext and encrypted backups):
+///  - Every file's content is a contiguous run of whole chunks in the global write
+///    order (buckets by id, chunks by offset within a bucket).
+///  - The run's <c>dedup_size</c>s sum exactly to the file size.
+///  - The version_list <c>tag</c> = MD5(concatenation of the run's chunk content-MD5s).
+///    For a single-chunk file this reduces to MD5(MD5(content)). (Very large files
+///    use a higher tier hash for the tag, but their run is unique, so size alone
+///    resolves them.)
+///
+/// This means a file's chunks can be found from metadata only (bucket indexes +
+/// the tag) without reading or decrypting any chunk data. Deduplicated files, whose
+/// chunks are not contiguous, are the one case this does not cover.
 /// </summary>
 public sealed class PoolReader
 {
     private readonly IBackupStorage _storage;
     private readonly RepoPaths _paths;
-    private Dictionary<string, ChunkLocation>? _byContentMd5;
-    private Dictionary<string, ChunkLocation>? _byTag;
+
+    private List<OrderedChunk>? _ordered;
+    private long[]? _prefix;                          // prefix[k] = sum of dedup sizes of chunks [0,k)
+    private Dictionary<long, List<int>>? _prefixIndex; // prefix value -> indices
 
     public PoolReader(IBackupStorage storage, RepoPaths paths)
     {
@@ -28,59 +40,111 @@ public sealed class PoolReader
         _paths = paths;
     }
 
-    /// <summary>All bucket data blob paths ("Pool/.../{N}.bucket.&lt;gen&gt;").</summary>
-    public IReadOnlyList<string> BucketPaths() =>
-        _paths.All.Where(RepoPaths.IsBucketData).OrderBy(p => p, StringComparer.Ordinal).ToList();
-
-    private void EnsureIndex()
+    /// <summary>All chunks across all buckets, in global write order.</summary>
+    public IReadOnlyList<OrderedChunk> OrderedChunks()
     {
-        if (_byContentMd5 is not null)
-            return;
+        if (_ordered is not null)
+            return _ordered;
 
-        var byContent = new Dictionary<string, ChunkLocation>(StringComparer.OrdinalIgnoreCase);
-        var byTag = new Dictionary<string, ChunkLocation>(StringComparer.OrdinalIgnoreCase);
-        foreach (var indexPath in _paths.BucketIndexes())
+        var bucketPaths = _paths.All
+            .Where(RepoPaths.IsBucketData)
+            .OrderBy(BucketId)
+            .ToList();
+
+        var list = new List<OrderedChunk>();
+        foreach (var bucketPath in bucketPaths)
         {
-            // The chunk_index/ global dedup table is "*.idx.N"; the per-bucket index
-            // is "*.index.N" with a sibling "*.bucket.N" (same generation).
-            var bucketPath = RepoPaths.BucketDataForIndex(indexPath);
-            if (!_storage.Exists(bucketPath))
+            var indexPath = bucketPath.Replace(".bucket.", ".index.");
+            if (!_storage.Exists(indexPath))
                 continue;
-
-            var indexBytes = ReadAll(indexPath);
-            foreach (var entry in BucketIndex.Parse(indexBytes))
-            {
-                var loc = new ChunkLocation(bucketPath, entry);
-                byContent[entry.Md5Hex] = loc;
-                // The version_list "tag" key is MD5(content_md5); index by it too so
-                // files can be resolved to chunks without reading any chunk data.
-                byTag[Convert.ToHexString(MD5.HashData(entry.Md5))] = loc;
-            }
+            foreach (var entry in BucketIndex.Parse(ReadAll(indexPath)))
+                list.Add(new OrderedChunk(new ChunkLocation(bucketPath, entry), entry.DedupSize, entry.Md5));
         }
-        _byContentMd5 = byContent;
-        _byTag = byTag;
-    }
-
-    /// <summary>Locate a chunk by its content MD5 (the inner MD5 stored in the bucket index).</summary>
-    public bool TryLocate(byte[] contentMd5, out ChunkLocation location)
-    {
-        EnsureIndex();
-        return _byContentMd5!.TryGetValue(Convert.ToHexString(contentMd5), out location!);
+        _ordered = list;
+        return list;
     }
 
     /// <summary>
-    /// Locate a chunk by the version_list tag value, which equals MD5(content_md5).
-    /// This is how small files reference their single chunk.
+    /// Resolve a file (by size and tag) to its ordered chunk list, or null if it
+    /// cannot be resolved from metadata (e.g. a deduplicated, non-contiguous file).
     /// </summary>
-    public bool TryLocateByTag(byte[] tagMd5, out ChunkLocation location)
+    public IReadOnlyList<ChunkLocation>? ResolveFileChunks(long size, byte[] tag)
     {
-        EnsureIndex();
-        return _byTag!.TryGetValue(Convert.ToHexString(tagMd5), out location!);
+        EnsureResolver();
+        var oc = _ordered!;
+        var prefix = _prefix!;
+
+        var candidates = new List<(int Start, int End)>();
+        for (var j = 1; j <= oc.Count; j++)
+        {
+            var need = prefix[j] - size;
+            if (need < 0)
+                continue;
+            if (!_prefixIndex!.TryGetValue(need, out var starts))
+                continue;
+            foreach (var i in starts)
+            {
+                if (i >= j)
+                    continue;
+                if (TagMatches(oc, i, j, tag))
+                    return Slice(oc, i, j); // confident: size + tag both match
+                candidates.Add((i, j));
+            }
+        }
+
+        // Large files use a tiered tag the run doesn't reproduce; their run is unique.
+        return candidates.Count == 1 ? Slice(oc, candidates[0].Start, candidates[0].End) : null;
     }
 
     /// <summary>Read the raw stored bytes of a chunk (still encrypted/compressed if the repo is).</summary>
     public byte[] ReadRawChunk(ChunkLocation loc) =>
         _storage.ReadRange(loc.BucketPath, loc.Entry.BucketOffset, (int)loc.Entry.ChunkSize);
+
+    // --- internals ---
+
+    private void EnsureResolver()
+    {
+        if (_prefix is not null)
+            return;
+        var oc = OrderedChunks();
+        var prefix = new long[oc.Count + 1];
+        var index = new Dictionary<long, List<int>>();
+        for (var k = 0; k <= oc.Count; k++)
+        {
+            if (k > 0)
+                prefix[k] = prefix[k - 1] + oc[k - 1].DedupSize;
+            if (!index.TryGetValue(prefix[k], out var l))
+                index[prefix[k]] = l = [];
+            l.Add(k);
+        }
+        _prefix = prefix;
+        _prefixIndex = index;
+    }
+
+    private static bool TagMatches(IReadOnlyList<OrderedChunk> oc, int start, int end, byte[] tag)
+    {
+        using var md5 = MD5.Create();
+        for (var k = start; k < end; k++)
+            md5.TransformBlock(oc[k].Md5, 0, oc[k].Md5.Length, null, 0);
+        md5.TransformFinalBlock([], 0, 0);
+        return md5.Hash!.AsSpan().SequenceEqual(tag);
+    }
+
+    private static List<ChunkLocation> Slice(IReadOnlyList<OrderedChunk> oc, int start, int end)
+    {
+        var run = new List<ChunkLocation>(end - start);
+        for (var k = start; k < end; k++)
+            run.Add(oc[k].Location);
+        return run;
+    }
+
+    /// <summary>Numeric bucket id from a path like "Pool/0/0/12.bucket.3" -> 12.</summary>
+    private static int BucketId(string path)
+    {
+        var name = path[(path.LastIndexOf('/') + 1)..];
+        var dot = name.IndexOf('.');
+        return dot > 0 && int.TryParse(name[..dot], out var id) ? id : 0;
+    }
 
     private byte[] ReadAll(string path)
     {

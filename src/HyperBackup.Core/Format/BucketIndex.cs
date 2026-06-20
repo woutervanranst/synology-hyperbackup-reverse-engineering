@@ -8,7 +8,7 @@ namespace HyperBackup.Core.Format;
 /// <param name="BucketOffset">Cumulative physical byte offset of the chunk within the .bucket.2 file.</param>
 /// <param name="DedupSize">Original (uncompressed, pre-encryption) size of the data.</param>
 /// <param name="Md5">MD5 of the original plaintext content (the dedup/content key).</param>
-public readonly record struct ChunkEntry(uint ChunkSize, uint BucketOffset, uint DedupSize, byte[] Md5, uint Fingerprint)
+public readonly record struct ChunkEntry(uint ChunkSize, uint BucketOffset, uint DedupSize, byte[] Md5)
 {
     public string Md5Hex => Convert.ToHexString(Md5);
 }
@@ -38,13 +38,13 @@ public static class BucketIndex
             var bucketOffset = BinaryPrimitives.ReadUInt32BigEndian(span[4..]);
             var dedupSize = BinaryPrimitives.ReadUInt32BigEndian(span[8..]);
             var md5 = span.Slice(12, 16).ToArray();
-            var fingerprint = BinaryPrimitives.ReadUInt32BigEndian(span[28..]);
+            // bytes 28-31 are a 4-byte fingerprint of unknown purpose; not needed.
 
             // A trailing all-zero entry would mean the index has slack; skip empties.
             if (chunkSize == 0 && dedupSize == 0 && IsAllZero(md5))
                 continue;
 
-            entries.Add(new ChunkEntry(chunkSize, bucketOffset, dedupSize, md5, fingerprint));
+            entries.Add(new ChunkEntry(chunkSize, bucketOffset, dedupSize, md5));
         }
         return entries;
     }

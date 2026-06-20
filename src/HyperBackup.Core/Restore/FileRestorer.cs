@@ -31,12 +31,14 @@ public sealed class FileRestorer
 
             case StorageKind.InlineTag:
             {
-                // The tag is MD5(content_md5); the PoolReader indexes chunks by that key.
-                var tag = file.TagMd5!;
-                if (!_repo.Pool.TryLocateByTag(tag, out var loc))
+                // A file is a contiguous run of chunks summing to its size; the tag
+                // (MD5 of the concatenated chunk MD5s) disambiguates. See PoolReader.
+                var run = _repo.Pool.ResolveFileChunks(file.Size, file.TagMd5!);
+                if (run is null || run.Count == 0)
                     return FileLocation.None(StorageKind.InlineTag,
-                        $"chunk for tag {Convert.ToHexString(tag)} not found in any bucket index");
-                return new FileLocation(StorageKind.InlineTag, [loc.BucketPath], loc, null, null);
+                        "could not resolve chunk run (deduplicated/non-contiguous file or not found)");
+                var blobs = run.Select(c => c.BucketPath).Distinct().OrderBy(p => p, StringComparer.Ordinal).ToList();
+                return new FileLocation(StorageKind.InlineTag, blobs, run, null, null);
             }
 
             case StorageKind.FilePool:
@@ -45,50 +47,45 @@ public sealed class FileRestorer
                 if (id is null)
                     return FileLocation.None(StorageKind.FilePool,
                         "could not map file to a file-pool blob from metadata");
-                return new FileLocation(StorageKind.FilePool, [_repo.FilePool.BlobPath(id.Value)], null, id, null);
+                return new FileLocation(StorageKind.FilePool, [_repo.FilePool.BlobPath(id.Value)], [], id, null);
             }
 
             default:
                 return FileLocation.None(StorageKind.VirtualFileIndex,
-                    "content located via virtual_file.index B-tree (not implemented in this PoC)");
+                    "content located via virtual_file.index (no inline tag — Synology system files only)");
         }
     }
 
     /// <summary>Restore a file's original bytes. Throws if it cannot be located/restored.</summary>
-    public byte[] Restore(int versionId, FileEntry file)
+    public byte[] Restore(FileEntry file)
     {
         var location = Locate(file);
         return file.Kind switch
         {
             StorageKind.Empty => [],
-            StorageKind.InlineTag => RestoreInlineTag(versionId, file, location),
-            StorageKind.FilePool => RestoreFilePool(versionId, file, location),
+            StorageKind.InlineTag => RestoreChunked(file, location),
+            StorageKind.FilePool => RestoreFilePool(file, location),
             StorageKind.Directory => throw new InvalidOperationException($"'{file.Name}' is a directory."),
             _ => throw new NotSupportedException(
-                $"'{file.Name}' is stored via the virtual_file.index B-tree, which this PoC does not yet parse."),
+                $"'{file.Name}' has no inline tag (located via virtual_file.index); not supported in this PoC."),
         };
     }
 
-    private byte[] RestoreInlineTag(int versionId, FileEntry file, FileLocation location)
+    private byte[] RestoreChunked(FileEntry file, FileLocation location)
     {
-        if (location.Chunk is not { } loc)
-            throw new InvalidDataException(location.Note ?? "chunk not found.");
+        if (location.Chunks.Count == 0)
+            throw new InvalidDataException(location.Note ?? "chunk run not resolved.");
 
-        var content = DecryptChunkContent(loc);
+        using var ms = new MemoryStream();
+        foreach (var loc in location.Chunks)
+            ms.Write(DecryptChunkContent(loc));
 
-        // The bucket index stores the content MD5; the version_list tag is MD5(content MD5).
-        VerifyMd5(content, loc.Entry.Md5, file.Name);
-        if (file.TagMd5 is { } tag)
-        {
-            var doubleMd5 = MD5.HashData(loc.Entry.Md5);
-            if (!doubleMd5.AsSpan().SequenceEqual(tag))
-                throw new InvalidDataException($"Tag (double-MD5) mismatch restoring '{file.Name}'.");
-        }
+        var content = ms.ToArray();
         VerifySize(content, file.Size, file.Name);
         return content;
     }
 
-    private byte[] RestoreFilePool(int versionId, FileEntry file, FileLocation location)
+    private byte[] RestoreFilePool(FileEntry file, FileLocation location)
     {
         if (location.FilePoolId is not { } id)
             throw new InvalidDataException(location.Note ?? "file-pool blob not found.");
@@ -104,18 +101,16 @@ public sealed class FileRestorer
             }
             else
             {
-                var xz = _repo.FilePool.ReadRawPayload(id);
-                content = Xz.Decompress(xz);
+                content = Xz.Decompress(_repo.FilePool.ReadRawPayload(id));
             }
         }
         catch (Exception ex)
         {
             throw new InvalidDataException(
-                $"Could not decompress file-pool blob for '{file.Name}' (Pool/file_pool/{id}.file.2): {ex.Message}. " +
+                $"Could not decompress file-pool blob for '{file.Name}' ({_repo.FilePool.BlobPath(id)}): {ex.Message}. " +
                 "The file-pool internal segment format is only partially reverse-engineered.", ex);
         }
 
-        // Validate against the file-pool checksum (MD5 of original content).
         var entry = _repo.FilePool.Entries().FirstOrDefault(e => e.Id == id);
         if (entry is not null)
             VerifyMd5(content, entry.Checksum, file.Name);
@@ -124,15 +119,19 @@ public sealed class FileRestorer
     }
 
     /// <summary>
-    /// Read and (if encrypted) decrypt a chunk into its original bytes. Tries the
-    /// candidate version keys, accepting the one whose decrypted content MD5 matches
-    /// the bucket index (so the right key is found even for deduplicated chunks).
+    /// Read and (if encrypted) decrypt one chunk into its original bytes, verifying
+    /// the content MD5 against the bucket index. For encrypted repos this tries the
+    /// candidate version keys and accepts the one that matches (handles deduplicated
+    /// chunks whose key belongs to a different version than the bucket's generation).
     /// </summary>
     private byte[] DecryptChunkContent(ChunkLocation loc)
     {
         var raw = _repo.Pool.ReadRawChunk(loc);
         if (!_repo.IsEncrypted)
+        {
+            VerifyMd5(raw, loc.Entry.Md5, "chunk");
             return raw;
+        }
 
         Exception? last = null;
         foreach (var vid in _repo.CandidateVersions(loc.BucketPath))
@@ -166,10 +165,7 @@ public sealed class FileRestorer
         }
 
         // Fallback for the common single-large-file case.
-        if (entries.Count == 1)
-            return entries[0].Id;
-
-        return null;
+        return entries.Count == 1 ? entries[0].Id : null;
     }
 
     private static void VerifyMd5(byte[] content, byte[] expected, string name)
