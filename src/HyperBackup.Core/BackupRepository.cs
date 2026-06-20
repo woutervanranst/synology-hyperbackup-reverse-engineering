@@ -24,6 +24,8 @@ public sealed class BackupRepository
     public IBackupStorage Storage { get; }
     public RepoPaths Paths { get; }
     public PoolReader Pool { get; }
+    public FileChunkIndex FileChunks { get; }
+    public VirtualFileIndex VirtualFiles { get; }
     public FilePool FilePool { get; }
 
     public bool IsEncrypted { get; }
@@ -38,6 +40,8 @@ public sealed class BackupRepository
         _externalRsaKey = rsaPrivateKey;
         Paths = new RepoPaths(storage);
         Pool = new PoolReader(storage, Paths);
+        FileChunks = new FileChunkIndex(storage, Paths, Pool);
+        VirtualFiles = new VirtualFileIndex(storage, Paths);
         FilePool = new FilePool(storage, Paths);
 
         var info = ReadBackupInfo();

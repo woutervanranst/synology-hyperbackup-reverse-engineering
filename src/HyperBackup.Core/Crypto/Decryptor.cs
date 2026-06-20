@@ -24,18 +24,37 @@ public sealed class Decryptor
     }
 
     /// <summary>
-    /// Decrypt (and decompress) a chunk's stored ciphertext into the original bytes.
+    /// Decrypt a chunk's stored ciphertext and yield the candidate original-byte
+    /// interpretations, best-guess first. A compressed repo stores some chunks
+    /// uncompressed (small/incompressible ones), and the post-AES length alone does not
+    /// always tell the two apart, so both the as-is and the LZ4-decompressed forms are
+    /// offered; the caller selects the one whose MD5 matches the chunk's content hash.
     /// </summary>
     /// <param name="ciphertext">Exactly chunk_size bytes read from the bucket (excludes the 4-byte tag).</param>
     /// <param name="originalSize">dedup_size: the original uncompressed length.</param>
-    public byte[] DecryptChunk(byte[] ciphertext, int originalSize)
+    public IEnumerable<byte[]> DecryptChunkCandidates(byte[] ciphertext, int originalSize)
     {
-        // AesDecrypt strips PKCS7, yielding either the raw original (small/incompressible
-        // chunks are stored uncompressed even in a compressed repo) or an LZ4 block.
+        // AesDecrypt strips PKCS7, yielding either the raw original or an LZ4 block.
         var plain = AesDecrypt(ciphertext, _versionKey.FileKey, _versionKey.FileIv);
-        if (!_compressed || plain.Length == originalSize)
-            return plain;
-        return Lz4Block.Decompress(plain, originalSize);
+        if (!_compressed)
+        {
+            yield return plain;
+            yield break;
+        }
+        // Prefer the interpretation implied by the length, but offer the other too.
+        if (plain.Length == originalSize)
+            yield return plain;
+        var inflated = TryInflate(plain, originalSize);
+        if (inflated is not null)
+            yield return inflated;
+        if (plain.Length != originalSize)
+            yield return plain;
+    }
+
+    private static byte[]? TryInflate(byte[] block, int originalSize)
+    {
+        try { return Lz4Block.Decompress(block, originalSize); }
+        catch { return null; }
     }
 
     /// <summary>

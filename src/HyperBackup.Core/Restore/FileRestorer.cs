@@ -31,12 +31,11 @@ public sealed class FileRestorer
 
             case StorageKind.InlineTag:
             {
-                // A file is a contiguous run of chunks summing to its size; the tag
-                // (MD5 of the concatenated chunk MD5s) disambiguates. See PoolReader.
-                var run = _repo.Pool.ResolveFileChunks(file.Size, file.TagMd5!);
+                var run = ResolveChunks(file);
                 if (run is null || run.Count == 0)
                     return FileLocation.None(StorageKind.InlineTag,
-                        "could not resolve chunk run (deduplicated/non-contiguous file or not found)");
+                        "could not resolve the file's chunk list (very large files whose chunk " +
+                        "list spans multiple B+-tree nodes are not yet supported)");
                 var blobs = run.Select(c => c.BucketPath).Distinct().OrderBy(p => p, StringComparer.Ordinal).ToList();
                 return new FileLocation(StorageKind.InlineTag, blobs, run, null, null);
             }
@@ -54,6 +53,25 @@ public sealed class FileRestorer
                 return FileLocation.None(StorageKind.VirtualFileIndex,
                     "content located via virtual_file.index (no inline tag — Synology system files only)");
         }
+    }
+
+    /// <summary>
+    /// Resolve a file's ordered chunk list. Layered, most-authoritative first:
+    ///  1. the virtual_file.index pointer → the exact file_chunk leaf (deterministic,
+    ///     disambiguates files of identical size), validated by total size;
+    ///  2. the file_chunk index matched by size + reproducible content tag;
+    ///  3. the contiguous-run heuristic over the global chunk order (covers files not
+    ///     present in the file_chunk index, and large contiguous files).
+    /// </summary>
+    private IReadOnlyList<ChunkLocation>? ResolveChunks(FileEntry file)
+    {
+        if (_repo.VirtualFiles.Locate(file.OffVirtualFile) is { } ptr
+            && _repo.FileChunks.LeafAt(ptr.Tier, ptr.ValueOffset) is { } byPointer
+            && byPointer.Sum(c => (long)c.Entry.DedupSize) == file.Size)
+            return byPointer;
+
+        return _repo.FileChunks.Lookup(file.Size, file.TagMd5)
+               ?? _repo.Pool.ResolveFileChunks(file.Size, file.TagMd5!);
     }
 
     /// <summary>Restore a file's original bytes. Throws if it cannot be located/restored.</summary>
@@ -138,9 +156,9 @@ public sealed class FileRestorer
         {
             try
             {
-                var content = _repo.GetDecryptor(vid).DecryptChunk(raw, (int)loc.Entry.DedupSize);
-                if (MD5.HashData(content).AsSpan().SequenceEqual(loc.Entry.Md5))
-                    return content;
+                foreach (var content in _repo.GetDecryptor(vid).DecryptChunkCandidates(raw, (int)loc.Entry.DedupSize))
+                    if (MD5.HashData(content).AsSpan().SequenceEqual(loc.Entry.Md5))
+                        return content;
             }
             catch (Exception ex)
             {

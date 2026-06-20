@@ -10,26 +10,23 @@ public sealed record ChunkLocation(string BucketPath, ChunkEntry Entry);
 public sealed record OrderedChunk(ChunkLocation Location, uint DedupSize, byte[] Md5);
 
 /// <summary>
-/// Reads the Pool's chunk store and resolves a file to its ordered list of chunks.
+/// Reads the Pool's chunk store: the per-bucket chunk indexes, raw chunk bytes, and
+/// a (bucket id, entry index) → chunk resolver used by <see cref="FileChunkIndex"/>.
 ///
-/// Reverse-engineered model (verified against plaintext and encrypted backups):
-///  - Every file's content is a contiguous run of whole chunks in the global write
-///    order (buckets by id, chunks by offset within a bucket).
-///  - The run's <c>dedup_size</c>s sum exactly to the file size.
-///  - The version_list <c>tag</c> = MD5(concatenation of the run's chunk content-MD5s).
-///    For a single-chunk file this reduces to MD5(MD5(content)). (Very large files
-///    use a higher tier hash for the tag, but their run is unique, so size alone
-///    resolves them.)
-///
-/// This means a file's chunks can be found from metadata only (bucket indexes +
-/// the tag) without reading or decrypting any chunk data. Deduplicated files, whose
-/// chunks are not contiguous, are the one case this does not cover.
+/// Also offers <see cref="ResolveFileChunks"/>, a contiguous-run heuristic kept as a
+/// last-resort fallback: most files are written as a contiguous run of whole chunks in
+/// global write order (buckets by id, chunks by offset) whose <c>dedup_size</c>s sum to
+/// the file size, with version_list <c>tag</c> = MD5(concatenated chunk content-MD5s)
+/// disambiguating (a single chunk reduces to MD5(MD5(content))). The authoritative
+/// mapping — which also covers deduplicated, non-contiguous files — is
+/// <see cref="FileChunkIndex"/>; this heuristic only runs when that lookup cannot.
 /// </summary>
 public sealed class PoolReader
 {
     private readonly IBackupStorage _storage;
     private readonly RepoPaths _paths;
 
+    private Dictionary<int, Bucket>? _buckets;
     private List<OrderedChunk>? _ordered;
     private long[]? _prefix;                          // prefix[k] = sum of dedup sizes of chunks [0,k)
     private Dictionary<long, List<int>>? _prefixIndex; // prefix value -> indices
@@ -40,26 +37,46 @@ public sealed class PoolReader
         _paths = paths;
     }
 
+    private sealed record Bucket(string DataPath, IReadOnlyList<ChunkEntry> Entries);
+
+    /// <summary>All buckets keyed by numeric id, each with its parsed chunk index.</summary>
+    private Dictionary<int, Bucket> Buckets()
+    {
+        if (_buckets is not null)
+            return _buckets;
+
+        var map = new Dictionary<int, Bucket>();
+        foreach (var bucketPath in _paths.All.Where(RepoPaths.IsBucketData))
+        {
+            var indexPath = bucketPath.Replace(".bucket.", ".index.");
+            if (!_storage.Exists(indexPath))
+                continue;
+            map[BucketId(bucketPath)] = new Bucket(bucketPath, BucketIndex.Parse(ReadAll(indexPath)));
+        }
+        _buckets = map;
+        return map;
+    }
+
+    /// <summary>Resolve a chunk by its bucket id and entry index, or null if out of range.</summary>
+    public ChunkLocation? ResolveBucketEntry(int bucketId, int entryIndex)
+    {
+        if (!Buckets().TryGetValue(bucketId, out var b))
+            return null;
+        if (entryIndex < 0 || entryIndex >= b.Entries.Count)
+            return null;
+        return new ChunkLocation(b.DataPath, b.Entries[entryIndex]);
+    }
+
     /// <summary>All chunks across all buckets, in global write order.</summary>
     public IReadOnlyList<OrderedChunk> OrderedChunks()
     {
         if (_ordered is not null)
             return _ordered;
 
-        var bucketPaths = _paths.All
-            .Where(RepoPaths.IsBucketData)
-            .OrderBy(BucketId)
-            .ToList();
-
         var list = new List<OrderedChunk>();
-        foreach (var bucketPath in bucketPaths)
-        {
-            var indexPath = bucketPath.Replace(".bucket.", ".index.");
-            if (!_storage.Exists(indexPath))
-                continue;
-            foreach (var entry in BucketIndex.Parse(ReadAll(indexPath)))
-                list.Add(new OrderedChunk(new ChunkLocation(bucketPath, entry), entry.DedupSize, entry.Md5));
-        }
+        foreach (var id in Buckets().Keys.OrderBy(x => x))
+            foreach (var entry in Buckets()[id].Entries)
+                list.Add(new OrderedChunk(new ChunkLocation(Buckets()[id].DataPath, entry), entry.DedupSize, entry.Md5));
         _ordered = list;
         return list;
     }

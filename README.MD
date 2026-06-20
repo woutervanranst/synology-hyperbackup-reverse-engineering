@@ -85,7 +85,8 @@ A working .NET 10 proof-of-concept that reads this format lives in [`src/`](src/
 - **`HyperBackup.Cli`** (`hbk`) — a CLI exposing four core capabilities:
   1. `list` — enumerate every file in a backup version (decrypting filenames)
   2. `restore` — restore a file's bytes (verified end-to-end on the unencrypted
-     sample *and* on a real encrypted Azure backup, for small single-chunk files)
+     sample *and* on a real encrypted Azure backup, including multi-chunk and
+     deduplicated files)
   3. `archive-plan` — decide which blobs can move to the Azure Archive tier
   4. `rehydrate` — determine and rehydrate the exact blob(s) needed for one file
 
@@ -210,25 +211,28 @@ Verified working against **real encrypted cloud backups**, and byte-for-byte
 against an unencrypted backup's original source files:
 
 - `list` (including correctly decrypted filenames),
-- `restore` of **single-chunk and large multi-chunk files** — e.g. a 7 MB,
-  875-chunk file restored MD5-identical to source, and encrypted multi-chunk
-  files restored to valid originals (MD5 + size verified on every restore),
+- `restore` of **single-chunk, multi-chunk, and deduplicated files** — e.g. a 7 MB,
+  875-chunk file and a non-contiguous PDF that reuses chunks internally, both
+  restored MD5-identical to source; on an encrypted backup, a 9.8 MB / 1251-chunk
+  deduplicated file and split-archive parts of *identical size* each restored to
+  their distinct, correct originals (MD5 + size verified on every restore),
 - `archive-plan`, and
 - per-file `rehydrate` (resolves every bucket a file's chunks span).
 
-How multi-chunk files are resolved (see [Chunk Manifest](#chunk-manifest)):
-a file's chunks are the contiguous run, in global write order, whose `dedup_size`s
-sum to the file size; the `tag` (= `MD5` of the concatenated chunk content-MD5s)
-disambiguates. This needs **no chunk-manifest parsing** — only the bucket indexes
-and the tag, both plaintext even in encrypted backups.
+How a file's chunks are resolved (see [Chunk Manifest](#chunk-manifest)): the
+file's `off_virtual_file` points to its `virtual_file.index` record, which names the
+exact `file_chunk{tier}.index` leaf holding its **ordered chunk list**; each entry
+is resolved through `chunk_index` to a `(bucket, entry)` and thus a physical chunk.
+This is authoritative and handles deduplicated/non-contiguous files and files that
+merely share a size. All of these indexes are plaintext even in encrypted backups.
 
 Remaining gaps:
 
-- **Deduplicated files** whose chunks are *not* contiguous (a chunk shared with
-  an earlier file) can't be resolved by the implicit run model; they need the
-  `file_chunk*.index` manifest, whose 4-tier node format is only partly decoded.
-- **`@AppConfig` system files without an inline tag** (e.g. `_Syno_TaskConfig`)
-  are located via `virtual_file.index` and are not restored (not user data).
+- **Very large files whose chunk list spans multiple B+-tree nodes** (roughly
+  > 4000 chunks / > 32 MB) are not yet reassembled across nodes; a contiguous-run
+  fallback covers them only when the file happens to be contiguous.
+- **Tagless `@AppConfig` system files** (e.g. `_Syno_TaskConfig`) are not restored
+  (not user data), though their chunk lists are present in the index.
 - The **file-pool internal segmenting** is only partially understood.
 
 ---
@@ -277,11 +281,11 @@ synology_1.hbk/
       Video/
         1.db.2                          # SQLite: file listing, version 1
         complete_list.db.2              # SQLite: completion tracking
-    file_chunk1.index/0.idx.2           # Binary index: chunk-to-file tier 1
-    file_chunk2.index/0.idx.2           # Binary index: chunk-to-file tier 2
-    file_chunk3.index/0.idx.2           # Binary index: chunk-to-file tier 3
-    file_chunk4.index/0.idx.2           # Binary index: chunk-to-file tier 4
-    virtual_file.index/0.idx.2          # Binary index: B-tree virtual file map
+    file_chunk1.index/0.idx.2           # Binary index: per-file chunk lists, tier 1
+    file_chunk2.index/0.idx.2           # Binary index: per-file chunk lists, tier 2
+    file_chunk3.index/0.idx.2           # Binary index: per-file chunk lists, tier 3
+    file_chunk4.index/0.idx.2           # Binary index: per-file chunk lists, tier 4
+    virtual_file.index/0.idx.2          # Binary index: per-file record + chunk-list pointer
 
   Pool/
     bucketID.counter.2                  # 8-byte BE int: next bucket ID (=3)
@@ -293,7 +297,7 @@ synology_1.hbk/
       2.bucket.2                        # Raw chunk data (bucket 2)
       2.index.2                         # Chunk index for bucket 2
     chunk_index/
-      0.idx.2                           # Global chunk dedup hash table
+      0.idx.2                           # Global chunk table (29-byte records: bucket+entry+refcount)
     file_pool/
       1.file.2                          # XZ-compressed large file blob
       file_pool_map.db.2                # SQLite: file pool checksum map
@@ -576,36 +580,35 @@ Examples from the Video share (`tag` field shown = `MD5(MD5(content))`):
 
 Files without tags (directories) have `tag = NULL`. Files in the `@AppConfig`
 system share also have `tag = NULL` even when small (e.g. `_Syno_TaskConfig`,
-~900 bytes); their content is located through `virtual_file.index` /
-`file_chunk*.index` rather than an inline tag, and is not restored by the PoC
-(Synology system data, not user files).
+~900 bytes); they are Synology system data and are not restored by the PoC, though
+their chunk lists are present in the index just like any other file.
 
 Files above the threshold (like `config.dss`) have `off_virtual_file = -1` and are
 stored in the file pool instead.
 
 > **Multi-chunk files (cracked & verified):** large files are split into many
 > chunks that can span **multiple buckets** (each `.bucket` is filled to a fixed
-> ~50 MiB capacity, e.g. 52,432,240 bytes). A file's chunks are the **contiguous
-> run, in global write order (bucket id, then offset within a bucket), whose
-> `dedup_size`s sum to the file size**. The `tag` generalizes to **`MD5` of the
-> concatenation of that run's chunk content-MD5s** — for a single chunk this is
-> exactly `MD5(MD5(content))` — and disambiguates when several runs sum to the same
-> size. Restore = read those chunks in order, decrypt/decompress each, concatenate.
-> This is resolvable from metadata alone (bucket indexes + tag), so it works for
-> encrypted backups too (verified: a 7 MB / 875-chunk file restored MD5-identical
-> to its source). *Caveats:* very large files use a higher-tier `tag` (the run is
-> then identified by its unique size), and **deduplicated** files whose chunks are
-> not contiguous need the explicit [chunk manifest](#chunk-manifest).
+> ~50 MiB capacity, e.g. 52,432,240 bytes). The authoritative file → chunk mapping
+> is the [Chunk Manifest](#chunk-manifest): `off_virtual_file` → a `file_chunk` leaf
+> holding the file's **ordered chunk list**, resolved through `chunk_index` to
+> physical chunks. Restore = read those chunks in order, decrypt/decompress each,
+> concatenate. This handles **deduplicated** files (chunks reused or non-contiguous)
+> and files that merely share a size, and works on encrypted backups (all indexes
+> are plaintext). The `tag` is a secondary content key: its first 16 bytes are
+> `MD5` of the concatenated chunk content-MD5s — for a single chunk exactly
+> `MD5(MD5(content))` — used as a fallback disambiguator (very large files use a
+> higher-tier hash here that the PoC does not reproduce).
 
 #### `off_virtual_file` Field
 
-This integer is the byte offset of the file's record inside the virtual file index
-(`Config/virtual_file.index/0.idx.<gen>`). That record is per-entry **metadata
-only** — node id, parent id, uid/gid, create/modify timestamps (sec + nsec),
-permissions, and a trailing checksum (a fixed ~56 bytes); it does **not** contain
-chunk locations. File content is located via the `tag` + bucket indexes (above),
-not via this index. A value of `-1` is the sentinel meaning "stored in the file
-pool".
+This integer is the byte offset of the file's 56-byte record inside the virtual file
+index (`Config/virtual_file.index/0.idx.<gen>`). Most of the record is per-entry
+metadata — node/parent id, uid/gid, create/modify timestamps (sec + nsec),
+permissions, a trailing checksum — **but it begins with the pointer to the file's
+chunk list**: a big-endian `uint32` whose high 16 bits are the `file_chunk` **tier**
+(1–4), followed by a `uint32` that is the **byte offset of the chunk-list value**
+inside `Config/file_chunk{tier}.index/0.idx.<gen>`. A value of `-1` is the sentinel
+meaning "stored in the file pool".
 
 #### Entry Types in `version_list`
 
@@ -706,12 +709,25 @@ buckets 0, 1, 2 exist.
 
 ### 2. Chunk Index (`Pool/chunk_index/0.idx.2`)
 
-Global deduplication hash table. Maps chunk MD5 hashes to their bucket
-locations. This enables dedup: before storing a new chunk, its hash is looked
-up here. If found, the existing bucket reference is reused.
+Global chunk table. The chunk-list entries in `file_chunk*.index` are 8-byte
+big-endian **byte offsets into this blob**; each offset names a fixed **29-byte
+record** that locates the chunk physically:
 
-Uses the binary index format (Type 1, sparse hash-table variant). 131,173
-bytes with data at 64KB page boundaries.
+```
+Offset  Size  Field
+0x00    1     (pad, 0x00)
+0x01    4     bucket_id (big-endian) -- which Pool/0/0/{id}.bucket
+0x05    4     index_offset (big-endian) -- byte offset of the chunk's 32-byte entry
+              inside that bucket's .index blob (entry i is at 0x40 + 32*i)
+0x09    15    (zero)
+0x18    1     refcount -- how many files reference this chunk (>1 => deduplicated)
+0x19    4     fingerprint
+```
+
+So resolving a chunk is two hops: `file_chunk` offset → this record → `(bucket,
+entry)` → the [bucket index](#type-2-bucket-chunk-index-pool00index2) entry with the
+chunk's `chunk_size`, `bucket_offset`, `dedup_size`, and content MD5. Uses the
+binary index format (Type 1); the header word at `0x10` is the record stride (29).
 
 ### 3. File Pool (`Pool/file_pool/`)
 
@@ -760,10 +776,10 @@ magic bytes `7053 a86e`. All multi-byte integers are **big-endian**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | `0x00` | 4 | `magic` | Always `7053 a86e` |
-| `0x04` | 4 | `format_type` | 0=B-tree, 1=flat/hash, 2=bucket chunk index |
+| `0x04` | 4 | `format_type` | 0=paged record table, 1=B+-tree (TLV nodes), 2=bucket chunk index |
 | `0x08` | 4 | `param_a` | Tree depth (type 0), 0 (type 1), entry_version (type 2) |
 | `0x0C` | 4 | reserved | Always 0 |
-| `0x10` | 4 | `data_offset` | Offset to first data entry |
+| `0x10` | 4 | `record_size` | Fixed record stride (e.g. 29 for `chunk_index`); 0 when n/a |
 | `0x14` | 4 | reserved | Always 0 |
 | `0x18` | 4 | `declared_size` | Logical file size |
 | `0x1C` | 4 | `flags` | `0x08000000` or `0x09000000` |
@@ -801,88 +817,79 @@ Entry 1: size=5  offset=0  md5=5d41402abc4b2a76b9719d911017c592  ("hello")
 Entry 2: size=5  offset=5  md5=7d793037a0760186574b0282f2f435e7  ("world")
 ```
 
-### Type 1: Flat/Hash Index
+### Type 1: B+-Tree Index (TLV nodes)
 
 Used for:
 - `Config/file_chunk{1,2,3,4}.index/0.idx.2` -- the chunk manifest tiers (see below)
-- `Pool/chunk_index/0.idx.2` -- global dedup hash table
+- `Pool/chunk_index/0.idx.2` -- global chunk table
 
-These use 32KB declared page sizes with data at 64KB physical boundaries.
-The chunk index acts as a hash table mapping MD5 chunk hashes to bucket
-locations (bucket ID + offset).
+After the 0x40-byte header these are B+-tree nodes built from **TLV records**: a
+4-byte marker `{0xa9, 0x3b, kind, sub}` + a 4-byte big-endian length + that many
+payload bytes. `kind = 1` is a key, `kind = 2` is a value. Nodes sit at 64KB page
+boundaries (declared node size `0x8000`).
 
 ### Chunk Manifest
 
-A file's content is the **contiguous run of whole chunks**, in global write order
-(bucket id ascending, then offset within the bucket), whose `dedup_size`s sum to
-the file size. The file's run is identified without parsing any custom index:
+The authoritative file → chunk mapping. A file's
+[`off_virtual_file`](#off_virtual_file-field) names a `virtual_file.index` record
+whose leading words give a `file_chunk` **tier** (1–4) and the **byte offset** of
+that file's chunk-list value in `Config/file_chunk{tier}.index`. That value is the
+file's ordered chunk list:
 
 ```
-ordered_chunks = all bucket-index entries, sorted by (bucket_id, bucket_offset)
-for each contiguous run [i..j) whose sum(dedup_size) == file.size:
-    if MD5( concat( ordered_chunks[i..j].content_md5 ) ) == file.tag[0:16]:
-        -> this run is the file's chunk list
-(if no run matches the tag — very large files use a higher-tier tag — but exactly
- one run sums to the size, that run is the file)
+chunk-list value = N × (8-byte big-endian offset into chunk_index)   # the chunks, in order
+                 + (8-byte trailer: 0x74000000 ‖ crc)                # terminator
 ```
 
-So the `tag` is the file→chunks verifier, and the run order is implicit. This is
-why restore needs only the (always-plaintext) bucket indexes and tags, even for
-encrypted backups.
+Each 8-byte offset is resolved through [`chunk_index`](#2-chunk-index-poolchunk_index0idx2)
+to a `(bucket, entry)` and thus a physical chunk. Restore reads the chunks in order,
+decrypts/decompresses each (verifying its content MD5), and concatenates. Because the
+list is explicit and ordered, this handles **deduplicated** files — chunks reused
+within a file or shared across files (`refcount > 1`), and chunk runs that are not
+contiguous — and files that merely share a byte size. Files are spread across the
+four tiers by size; the tier is just where a file's leaf lives.
 
-The `file_chunk{1,2,3,4}.index` files are a 4-tier index that stores this
-file→chunk mapping explicitly (a Merkle-style tier tree; the top tier feeds the
-large-file `tag`). The PoC does **not** parse them because the implicit run model
-above resolves all non-deduplicated files. They are only required for
-**deduplicated** files, whose chunks are *not* contiguous (a chunk is shared with
-an earlier file), and for which the run model therefore fails. Their exact node
-format is only partially decoded.
+The `tag` (in `version_list`) is a secondary content key: `tag[0:16]` = `MD5` of the
+concatenated chunk content-MD5s (for one chunk, `MD5(MD5(content))`). The PoC uses it
+only as a fallback disambiguator; very large files use a higher-tier hash here that is
+not reproduced. A contiguous-run heuristic (the run of `(bucket_id, offset)`-ordered
+chunks whose `dedup_size`s sum to the file size) is kept as a last resort for files
+absent from the index or whose chunk list spans multiple B+-tree nodes.
 
 ### Type 0: B-Tree Paged Index (`Config/virtual_file.index/0.idx.2`)
 
-A B-tree index of the virtual filesystem. Each leaf entry holds file/directory
-**metadata only** — node id, parent id, uid/gid, create/modify timestamps
-(sec + nsec), permissions, and a trailing checksum — in fixed ~56-byte records
-(confirmed: a 37 MB file's record is the same size as a 6 KB file's). It does
-**not** store chunk locations or pointers; a file's chunks come from the
-[chunk manifest](#chunk-manifest). The original "pointers to chunk data"
-description is incorrect.
+A paged index of the virtual filesystem, one fixed **56-byte record per file**
+(confirmed: a 37 MB file's record is the same size as a 6 KB file's; a file's
+`off_virtual_file` is the byte offset of its record here). Most of the record is
+metadata — node/parent id, uid/gid, create/modify timestamps (sec + nsec),
+permissions, a trailing checksum — **but it begins with the file's chunk-list
+pointer**: a big-endian `uint32` whose high 16 bits are the `file_chunk` tier (1–4),
+followed by a `uint32` byte offset of the chunk-list value within that tier's
+`file_chunk{tier}.index` (see [Chunk Manifest](#chunk-manifest)). The record ends
+with the same `(tier, offset)` pair pointing at the leaf's key. (Earlier notes here
+said this index holds no chunk pointers — that was incorrect.)
 
 **Header specifics:**
 - `format_type=0`, `tree_depth=2`
 - `declared_size=262368` (logical), physical file is 196,904 bytes
 - Pages at 64KB boundaries (0x00000, 0x10000, 0x20000, 0x30000)
 
-**Page structure:**
-```
-[4-byte CRC32] [B-tree node entries...]
-```
-
-**B-tree internal node**: Alternating child pointers and key entries.
-
-**Child pointer (8 bytes):**
-```
-Bytes 0-1: page_id (uint16)
-Bytes 2-3: reserved (0)
-Bytes 4-7: offset_in_page (uint32)
-```
-
-**Directory entry (~40 bytes):**
+**56-byte per-file record** (all big-endian; offsets relative to the record start =
+the file's `off_virtual_file`):
 
 | Offset | Size | Field |
 |--------|------|-------|
-| 0 | 4 | Node ID |
-| 4 | 4 | Parent ID |
-| 8 | 4 | UID |
-| 12 | 4 | GID |
-| 16 | 4 | Create time (seconds) |
-| 20 | 4 | Create time (nanoseconds) |
-| 24 | 4 | Reserved |
-| 28 | 4 | Modify time (seconds) |
-| 32 | 4 | Modify time (nanoseconds) |
-| 36 | 4 | Checksum |
+| `0x00` | 4 | chunk-list pointer word: high 16 bits = `file_chunk` tier (1–4) |
+| `0x04` | 4 | byte offset of the chunk-list value in `file_chunk{tier}.index` |
+| `0x08` | 4 | segment count (1; observed 2 in some multi-version entries) |
+| `0x0C` | 8 | flags/mode constants (`0x00000402`, `0x00000064` in the sample) |
+| `0x18` | 8 | modify time (seconds, nanoseconds) |
+| `0x24` | 8 | create time (seconds, nanoseconds) |
+| `0x30` | 4 | checksum |
+| `0x34` | 4..8 | trailing `(tier, key-offset)` pointer at the chunk-list leaf's key |
 
-**File entry (~48 bytes):** Similar but includes mode and size fields.
+The pages sit at 64KB boundaries and begin with a 4-byte CRC32; the leading and
+trailing pointer words are how a file reaches its [chunk list](#chunk-manifest).
 
 ---
 
@@ -1380,23 +1387,29 @@ plaintext = plaintext[:-pad_len].decode('utf-8')
 
 ### Step 5: Recover a File's Content (tag != NULL)
 
-A file's content is a contiguous run of chunks (see [Chunk Manifest](#chunk-manifest));
-the `tag` (bytes 0-15) verifies it and the size (bytes 16-19) bounds it:
+Resolve the file's ordered chunk list via the [Chunk Manifest](#chunk-manifest),
+then read those chunks in order:
 
 ```
-ordered = all bucket-index entries, sorted by (bucket_id, bucket_offset)
-          # each entry: content_md5, dedup_size, chunk_size, bucket_offset
-find the contiguous run [i..j) where:
-    sum(ordered[i..j].dedup_size) == file.size
-    AND MD5( concat(ordered[i..j].content_md5) ) == file.tag[0:16]
-    # single-chunk reduces to MD5(MD5(content)); very large files use a higher-tier
-    # tag, so fall back to the unique run whose dedup_sizes sum to file.size
-content = concatenate, for each entry in the run:
+# 1. Locate the chunk-list leaf from the file's metadata
+rec  = virtual_file.index[file.off_virtual_file : +56]
+tier = be32(rec, 0) >> 16                 # 1..4
+voff = be32(rec, 4)                       # byte offset into file_chunk{tier}.index
+val  = file_chunk{tier}.index value at voff   # (length = be32 at voff-4)
+
+# 2. The value is the ordered chunk list + an 8-byte trailer (0x74000000 ‖ crc)
+for each 8-byte big-endian offset `o` in val (excluding the trailer):
+    crec   = chunk_index[o : +29]
+    bucket = be32(crec, 1);  ioff = be32(crec, 5)
+    entry  = bucket {bucket}'s .index entry at byte ioff  # content_md5, dedup_size,
+                                                          # chunk_size, bucket_offset
+content = concatenate, for each chunk:
     plaintext:  read chunk_size bytes at bucket_offset from {bucket}.bucket
     encrypted:  read chunk_size bytes (a 4-byte integrity tag follows, excluded);
                 AES-256-CBC decrypt with file_key/file_iv; strip PKCS7; if the
                 result length != dedup_size, LZ4-block-decompress it to dedup_size
-                (small/incompressible chunks are stored uncompressed)
+                (small/incompressible chunks are stored uncompressed — when the
+                length is ambiguous, try both and keep the one whose MD5 matches)
 ```
 
 Verify each chunk's `MD5(plaintext) == content_md5` and the total length ==

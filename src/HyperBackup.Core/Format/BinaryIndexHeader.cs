@@ -12,7 +12,7 @@ public readonly struct BinaryIndexHeader
 {
     public const uint Magic = 0x7053_a86e;
 
-    /// <summary>0 = B-tree, 1 = flat/hash, 2 = bucket chunk index.</summary>
+    /// <summary>0 = paged record table, 1 = B+-tree (TLV nodes), 2 = bucket chunk index.</summary>
     public uint FormatType { get; init; }
 
     public static BinaryIndexHeader Parse(ReadOnlySpan<byte> data)

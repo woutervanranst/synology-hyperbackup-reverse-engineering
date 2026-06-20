@@ -6,13 +6,14 @@ public enum StorageKind
     /// <summary>A directory (no content).</summary>
     Directory,
 
-    /// <summary>Small file with an inline tag (MD5+size) -> a single chunk in a Pool bucket.</summary>
+    /// <summary>Regular file with a content tag -> one or more Pool chunks (resolved via
+    /// the file_chunk index; handles deduplicated/non-contiguous files).</summary>
     InlineTag,
 
     /// <summary>Large file (off_virtual_file == -1) -> an XZ blob in the file pool.</summary>
     FilePool,
 
-    /// <summary>Content located via the virtual_file.index B-tree (no inline tag). Not yet supported.</summary>
+    /// <summary>A tagless entry (Synology system files) located only via virtual_file.index. Not supported.</summary>
     VirtualFileIndex,
 
     /// <summary>Empty file (size 0) — nothing to restore.</summary>
