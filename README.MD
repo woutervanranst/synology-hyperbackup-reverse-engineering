@@ -1,5 +1,13 @@
 # Synology HyperBackup Cloud Image Format
 
+> [!NOTE]
+> This research is intended to identify which HyperBackup chunks are required
+> for each restore point, so chunks that are not currently needed can be moved
+> to the Azure Archive tier and later rehydrated before restore when needed.
+> The analysis was performed on my own backups, without leaked Synology source
+> code or confidential materials. This document describes observed behavior and
+> file formats, not copied Synology implementation code.
+
 Reverse-engineered from HyperBackup 4.1.2-4045 backups of a DS918+ NAS targeting
 Microsoft Azure Blob Storage. Two backup sets were analyzed:
 
