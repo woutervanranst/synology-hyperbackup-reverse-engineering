@@ -76,13 +76,7 @@ tracked across multiple SQLite databases and custom binary index files.
 
 ## Reference Implementation (PoC)
 
-A working .NET 10 proof-of-concept that reads this format lives in [`src/`](src/):
-
-- **`HyperBackup.Core`** — a storage-agnostic library: SQLite + binary-index
-  parsing, chunk/file-pool restore, AES / NaCl sealed-box / LZ4 / XZ crypto, and
-  an Azure-tier-aware archive planner. It runs against either a local folder
-  (`LocalDirectoryStorage`) or Azure Blob Storage (`AzureBlobStorage`).
-- **`HyperBackup.Cli`** (`hbk`) — a CLI exposing four core capabilities:
+A working .NET 10 proof-of-concept that reads this format lives in [`src/`](src/): a CLI exposing four core capabilities:
   1. `list` — enumerate every file in a backup version (decrypting filenames)
   2. `restore` — restore a file's bytes (verified end-to-end on the unencrypted
      sample *and* on a real encrypted Azure backup, including multi-chunk and
