@@ -46,6 +46,35 @@ deduplication-based, versioned backup system. Data is split into chunks identifi
 by MD5 hashes, stored in numbered "buckets" under a Pool directory. Metadata is
 tracked across multiple SQLite databases and custom binary index files.
 
+Two layers make up a repository: a **`Config/` metadata layer** that lists each
+version's files and points each file at its chunk list, and a **`Pool/` content-
+addressed store** where deduplicated chunks live in buckets. Restoring a file means
+walking from its metadata record down to the physical chunk bytes:
+
+```mermaid
+flowchart TD
+    subgraph Config["Config/ — versioned metadata (plaintext, even when encrypted)"]
+        VL["<b>version_list</b> (per share, per version)<br/>file → size, tag, off_virtual_file"]
+        VFI["<b>virtual_file.index</b><br/>56-byte record → file_chunk tier + leaf offset"]
+        FC["<b>file_chunk1..4.index</b><br/>leaf = file's ordered chunk list"]
+    end
+    subgraph Pool["Pool/ — content-addressed chunk store"]
+        CI["<b>chunk_index</b><br/>29-byte record → bucket id + entry"]
+        BI["<b>N.index</b> (bucket index)<br/>entry → offset, size, content MD5, refcount"]
+        BK["<b>N.bucket</b><br/>raw chunk bytes (AES + LZ4 if enabled)"]
+    end
+    VL -->|off_virtual_file| VFI
+    VFI -->|"tier + offset"| FC
+    FC -->|"8-byte refs (one per chunk, in order)"| CI
+    CI --> BI
+    BI -->|byte range| BK
+    BK -->|"decrypt + decompress + concatenate"| OUT(["restored file bytes"])
+```
+
+Deduplication falls out of this shape: many files' chunk lists can point at the same
+`chunk_index` entry (its `refcount` counts the references), so identical content —
+across files or backup versions — is stored only once.
+
 ### Key Design Principles
 
 - **Content-addressed storage**: Every chunk is identified by its MD5 hash (16 bytes).
@@ -57,7 +86,7 @@ tracked across multiple SQLite databases and custom binary index files.
   in buckets. Large files go to a separate file pool as XZ-compressed blobs.
 - **Cloud-aware**: Guard databases track upload state for resumable transfers.
 - **Optional encryption**: AES-256-CBC for data, with per-version keys wrapped by
-  NaCl `crypto_box_seal` (X25519 sealed boxes — *not* RSA; see the correction in
+  NaCl `crypto_box_seal` (X25519 + XSalsa20-Poly1305 sealed boxes; see
   [Encryption and Compression](#encryption-and-compression)). Encrypts chunk data,
   filenames, and config values while leaving SQLite schemas/structure in the clear.
 - **Optional compression**: LZ4 block compression applied before encryption.
@@ -207,8 +236,8 @@ hbk restore \
 
 ### Status / limitations
 
-Verified against the author's own Synology backups on Azure — one encrypted, one
-unencrypted — with restores checked byte-for-byte against the original source files.
+Tested against an encrypted and an unencrypted Synology backup on Azure, with
+restores checked byte-for-byte against the original source files.
 (The repo also bundles a tiny two-file sample under `target-azure-*/` for offline
 reproduction; the larger figures below come from those real backups, not that sample.)
 
@@ -235,14 +264,12 @@ encrypted one.
 
 Remaining gaps:
 
-- **Multi-segment chunk lists.** Exactly 1 of 2,494 files in the encrypted backup has
-  a `virtual_file.index` record with `count = 2` whose chunk list is split into two
-  non-adjacent segments; only the first is located, so the size/contiguous fallbacks
-  must cover it. This appears specific to that one (recreated) backup: deliberately
-  churning files in the unencrypted backup across **four versions** — including a
-  small append to the 67 MB file — never reproduced it (every file came back as a
-  single rewritten leaf, `count = 1`, restored byte-for-byte). So it is not a
-  limitation for normal use; the placement of segment 2 is simply not yet decoded.
+- **Multi-segment chunk lists.** Rare: a `virtual_file.index` record can carry
+  `count = 2`, meaning its chunk list is split into two non-adjacent segments. Normal
+  incremental backups instead rewrite a file's whole chunk list as a single leaf
+  (`count = 1`), so this is uncommon — 1 of 2,494 files in the encrypted backup, none
+  in the unencrypted one. Only the first segment is located; the placement of
+  segment 2 is not decoded, so the size/contiguous fallbacks cover this case.
 - **Tagless `@AppConfig` system files** (e.g. `_Syno_TaskConfig`) are not restored
   (not user data), though their chunk lists are present in the index.
 - The **file-pool internal segmenting** is only partially understood.
@@ -574,13 +601,12 @@ Bytes 0-15:  MD5(MD5(content))   -- the double-MD5 dedup key (NOT the raw conten
 Bytes 16-19: File size (big-endian uint32)
 ```
 
-> **Correction (verified by the reference implementation in `src/`):** the first
-> 16 bytes are **not** `MD5(content)`. They are `MD5` applied to the content's MD5,
-> i.e. `MD5(MD5(content))`. The bucket index
-> ([Type 2](#type-2-bucket-chunk-index-pool00index2)) stores the *content* MD5; to
-> locate a file's chunk, compute `MD5(content_md5)` for each bucket-index entry and
-> match it against the file's `tag[0:16]`. Because the bucket-index MD5 is always
-> stored in the clear, this lookup also works for encrypted backups.
+The first 16 bytes are `MD5(MD5(content))` — `MD5` applied to the content's MD5, not
+the raw content MD5. The [Type 2 bucket index](#type-2-bucket-chunk-index-pool00index2)
+stores the *content* MD5, so a single-chunk file is located by computing
+`MD5(content_md5)` for each bucket-index entry and matching it against `tag[0:16]`.
+Because the bucket-index MD5 is always in the clear, this lookup also works for
+encrypted backups.
 
 Examples from the Video share (`tag` field shown = `MD5(MD5(content))`):
 
@@ -598,7 +624,7 @@ their chunk lists are present in the index just like any other file.
 Files above the threshold (like `config.dss`) have `off_virtual_file = -1` and are
 stored in the file pool instead.
 
-> **Multi-chunk files (cracked & verified):** large files are split into many
+> **Multi-chunk files:** large files are split into many
 > chunks that can span **multiple buckets** (each `.bucket` is filled to a fixed
 > ~50 MiB capacity, e.g. 52,432,240 bytes). The authoritative file → chunk mapping
 > is the [Chunk Manifest](#chunk-manifest): `off_virtual_file` → a `file_chunk` leaf
@@ -609,7 +635,7 @@ stored in the file pool instead.
 > are plaintext). The `tag` is a secondary content key: its first 16 bytes are
 > `MD5` of the concatenated chunk content-MD5s — for a single chunk exactly
 > `MD5(MD5(content))` — used as a fallback disambiguator (very large files use a
-> higher-tier hash here that the PoC does not reproduce).
+> higher-tier hash here that is not decoded).
 
 #### `off_virtual_file` Field
 
@@ -804,9 +830,8 @@ magic bytes `7053 a86e`. All multi-byte integers are **big-endian**.
 Maps chunks within a single `.bucket.2` file. Used to locate and verify
 individual chunks.
 
-The 60-byte common header is followed by a 32-byte meta region (`0x20`–`0x3F`).
-**Actual chunk entries begin at offset `0x40`** and are 32 bytes each; the entry
-count is `(file_size - 0x40) / 32`. (Verified by the reference implementation.)
+Chunk entries begin at offset `0x40` (immediately after the 64-byte common header)
+and are 32 bytes each; the entry count is `(file_size - 0x40) / 32`.
 
 **Chunk Entry (32 bytes each, starting at `0x40`):**
 
@@ -818,9 +843,9 @@ count is `(file_size - 0x40) / 32`. (Verified by the reference implementation.)
 | 12 | 16 | `md5_hash` | MD5 hash of the chunk data |
 | 28 | 4 | `fingerprint` | Unknown 4-byte value (not CRC32) |
 
-**Verified**: Chunk offsets are cumulative (chunk N starts at sum of sizes 0..N-1),
-and the total equals the `.bucket.2` file size exactly. MD5 hashes verified
-against known data (`md5("hello")` = `5d41402abc4b2a76b9719d911017c592`).
+Chunk `bucket_offset`s are cumulative (chunk N starts at the sum of sizes 0..N-1),
+and the total equals the `.bucket.2` file size exactly. Each `md5_hash` is the MD5 of
+the chunk's plaintext content (e.g. `md5("hello")` = `5d41402abc4b2a76b9719d911017c592`).
 
 Example for bucket 1 (contains `test.txt` and `test2.txt`):
 
@@ -871,15 +896,14 @@ absent from the index or whose chunk list is split into multiple segments.
 ### Type 0: B-Tree Paged Index (`Config/virtual_file.index/0.idx.2`)
 
 A paged index of the virtual filesystem, one fixed **56-byte record per file**
-(confirmed: a 37 MB file's record is the same size as a 6 KB file's; a file's
+(a 37 MB file's record is the same size as a 6 KB file's; a file's
 `off_virtual_file` is the byte offset of its record here). Most of the record is
 metadata — node/parent id, uid/gid, create/modify timestamps (sec + nsec),
 permissions, a trailing checksum — **but it begins with the file's chunk-list
 pointer**: a big-endian `uint32` whose high 16 bits are the `file_chunk` tier (1–4),
 followed by a `uint32` byte offset of the chunk-list value within that tier's
 `file_chunk{tier}.index` (see [Chunk Manifest](#chunk-manifest)). The record ends
-with the same `(tier, offset)` pair pointing at the leaf's key. (Earlier notes here
-said this index holds no chunk pointers — that was incorrect.)
+with the same `(tier, offset)` pair pointing at the leaf's key.
 
 **Header specifics:**
 - `format_type=0`, `tree_depth=2`
@@ -1005,31 +1029,17 @@ structure remains identical -- all SQLite databases, binary index files, JSON
 configs, and counters exist in the same paths with the same schemas. Only the
 **content** of certain fields changes.
 
-> [!IMPORTANT]
-> **Major correction (verified by the reference implementation against a real
-> encrypted cloud backup + the exported key):** the per-version keys are **not**
-> RSA-wrapped. They use **NaCl `crypto_box_seal`** — libsodium *sealed boxes*
-> (Curve25519/X25519 + XSalsa20-Poly1305). The "encryption key" Synology exports
-> (e.g. `Microsoft Azure 1_private.pem`) is a **32-byte X25519 private key** (raw
-> bytes, despite the `.pem` name), and `public.pem.1` is the matching 32-byte
-> X25519 public key (`X25519(private) == public.pem.1`, confirmed). The `vkey`
-> blob sizes are the giveaway: `sealed_box(32-byte key)` = 32 (ephemeral pk) + 32
-> (ciphertext) + 16 (MAC) = **80 bytes**; `sealed_box(16-byte IV)` = 32 + 16 + 16
-> = **64 bytes**. Decryption:
-> ```
-> file_key = crypto_box_seal_open(vkey.rsa_vkey)      -> 32-byte AES-256 key
-> file_iv  = crypto_box_seal_open(vkey.rsa_vkey_iv)   -> 16-byte AES IV
-> ```
-> The exported X25519 key is **required** for cloud backups and is **not**
-> derivable from the password (the password only ever decrypts the *local*
-> `encKeys.1`, which is empty in the cloud). The full content pipeline, verified
-> end-to-end on real data:
-> `crypto_box_seal_open` → **AES-256-CBC** (PKCS7) → **LZ4 block** decompress to
-> `dedup_size` (small/incompressible chunks are stored *uncompressed* — detect by
-> `unpadded_len == dedup_size`) → MD5 matches the bucket index. Filenames decrypt
-> with `key = SHA256(x25519_private || unikey)`, `iv = MD5(unikey || unikeySalt2)`,
-> AES-256-CBC, base64(`+_`) — also confirmed. The "RSA-640/RSA-512/PKCS1" wording
-> below is the original (incorrect) guess, kept for context.
+Per-version AES keys are wrapped with **NaCl `crypto_box_seal`** — libsodium
+*sealed boxes* (X25519 + XSalsa20-Poly1305). The key Synology exports (e.g.
+`Microsoft Azure 1_private.pem`) is a 32-byte X25519 private key (raw bytes, despite
+the `.pem` name), and `Config/public.pem.1` is the matching 32-byte public key. The
+`vkey` blob sizes follow from this: `sealed_box(32-byte key)` = 32 (ephemeral pk) +
+32 (ciphertext) + 16 (MAC) = **80 bytes**, and `sealed_box(16-byte IV)` = 32 + 16 +
+16 = **64 bytes**. The exported key is required for cloud backups and is not derivable
+from the password — the password only decrypts the *local* `encKeys.1`, which holds
+only a header in the cloud. The full mechanism is detailed under
+[Encryption Key Hierarchy](#encryption-key-hierarchy) below. The `rsa_`-prefixed
+column names in `vkey.db` are a Synology naming artifact; the contents are sealed boxes.
 
 ### What Is Encrypted vs. Plaintext
 
@@ -1076,9 +1086,9 @@ Offset  Hex                               ASCII
 
 Binary blob -- NOT a PEM-format file despite the name. It is the **32-byte
 X25519 public key** used by the NaCl sealed boxes that wrap each version key.
-Verified: `X25519(exported_private_key) == public.pem.1`. The matching 32-byte
-X25519 private key is what the NAS exports as `Microsoft Azure 1_private.pem`
-(also raw bytes, not PEM text).
+It is the X25519 public key for the exported private key
+(`X25519(exported_private_key) == public.pem.1`). The matching 32-byte private key
+is what the NAS exports as `Microsoft Azure 1_private.pem` (also raw bytes, not PEM text).
 
 #### `Pool/vkey.db.2` (SQLite -- Version Key Database)
 
@@ -1361,7 +1371,7 @@ box      = SealedBox(PrivateKey(x25519_private_bytes))
 file_key = box.decrypt(rsa_vkey)      # 32 bytes — AES-256 key
 file_iv  = box.decrypt(rsa_vkey_iv)   # 16 bytes — AES IV
 
-# Derive filename decryption key (note: the X25519 private key bytes, NOT RSA)
+# Derive filename decryption key (from the X25519 private key bytes)
 filename_key = hashlib.sha256(x25519_private_bytes + unikey).digest()
 filename_iv  = hashlib.md5(unikey + unikey_salt2).digest()
 ```
@@ -1441,7 +1451,7 @@ with XZ/LZMA; the result is a GNU `tar` archive holding the file.
 > `MD5(MD5(content))` of the decompressed output. In the included sample,
 > `config.dss`'s XZ payload is truncated/corrupt (`xz` reports *"Compressed data is
 > corrupt"*), so it does not fully restore. The file-pool internal segment format
-> (header fields at `0x100`–`0x14C`) is only partially reverse-engineered.
+> (header fields at `0x100`–`0x14C`) is only partially decoded.
 
 ### Step 7: Skip Metadata Entries
 
@@ -1568,8 +1578,8 @@ CREATE TABLE file_pool_map (
 ```sql
 CREATE TABLE vkey (
   version_id INTEGER PRIMARY KEY,
-  rsa_vkey BLOB NOT NULL,          -- sealed_box(file_key), 80 bytes (NaCl, not RSA)
-  rsa_vkey_iv BLOB,                -- sealed_box(file_iv),  64 bytes (NaCl, not RSA)
+  rsa_vkey BLOB NOT NULL,          -- NaCl sealed_box(file_key), 80 bytes
+  rsa_vkey_iv BLOB,                -- NaCl sealed_box(file_iv),  64 bytes
   checksum BLOB,                   -- MD5 integrity check (16 bytes)
   ref_count INTEGER NOT NULL DEFAULT 0
 );
