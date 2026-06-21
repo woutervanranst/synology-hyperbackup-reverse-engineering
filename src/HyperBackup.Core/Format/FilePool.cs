@@ -48,9 +48,6 @@ public sealed class FilePool
         return _entries;
     }
 
-    public IReadOnlyList<string> BlobPaths() =>
-        _paths.All.Where(RepoPaths.IsFilePoolBlob).OrderBy(p => p, StringComparer.Ordinal).ToList();
-
     /// <summary>The blob path for a file-pool id, resolving its generation suffix.</summary>
     public string BlobPath(long id) => _paths.Require($"Pool/file_pool/{id}.file");
 

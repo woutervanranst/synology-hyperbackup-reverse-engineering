@@ -51,9 +51,6 @@ public sealed class BackupRepository
         Unikey = ReadUnikey();
     }
 
-    public static BackupRepository OpenLocal(string directory, string? passphrase = null, byte[]? rsaKey = null) =>
-        new(new LocalDirectoryStorage(directory), passphrase, rsaKey);
-
     // --- Versions ---
 
     public IReadOnlyList<BackupVersion> ListVersions()

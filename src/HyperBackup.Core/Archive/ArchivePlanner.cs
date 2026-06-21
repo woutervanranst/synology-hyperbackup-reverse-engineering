@@ -26,7 +26,6 @@ public sealed record RehydrationItem(string BlobPath, long Size, AccessTier Curr
 public sealed record RehydrationPlan(FileEntry File, IReadOnlyList<RehydrationItem> Items, string? Note)
 {
     public IEnumerable<RehydrationItem> ToRehydrate => Items.Where(i => i.NeedsRehydration);
-    public bool RestorableNow => Items.All(i => !i.NeedsRehydration) && Note is null;
 }
 
 /// <summary>

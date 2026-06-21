@@ -28,8 +28,6 @@ public sealed partial class RepoPaths
     public string Require(string baseNoGen) =>
         Find(baseNoGen) ?? throw new FileNotFoundException($"No blob found for '{baseNoGen}(.<gen>)'.");
 
-    public bool Exists(string baseNoGen) => Find(baseNoGen) is not null;
-
     private static bool IsGenerationOf(string path, string baseNoGen)
     {
         if (!path.StartsWith(baseNoGen + ".", StringComparison.Ordinal))

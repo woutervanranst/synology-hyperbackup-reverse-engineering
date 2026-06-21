@@ -48,7 +48,7 @@ public sealed class FileChunkIndex
     }
 
     /// <summary>One file's resolved chunk list, with the identity used to match it.</summary>
-    public sealed record Leaf(long TotalSize, byte[] ConcatMd5, IReadOnlyList<ChunkLocation> Chunks);
+    private sealed record Leaf(long TotalSize, byte[] ConcatMd5, IReadOnlyList<ChunkLocation> Chunks);
 
     /// <summary>
     /// Resolve a file's ordered chunk list from the file_chunk index, or null if the

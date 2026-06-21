@@ -106,12 +106,19 @@ format dependency is a NuGet package: XZ via **SharpCompress**, LZ4 via
 dotnet build HyperBackup.slnx
 ```
 
-The sandbox can't produce a native apphost, so invoke the built DLL directly
-rather than a `hbk` executable:
+Run any command with `dotnet run`:
 
 ```bash
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll <command> [storage] [options]
+dotnet run --project src/HyperBackup.Cli -- <command> [storage] [options]
 ```
+
+The examples below abbreviate that as `hbk`; define the alias once if you like:
+
+```bash
+alias hbk='dotnet run --project src/HyperBackup.Cli --'
+```
+
+Add `--verbose` to any command to print a full stack trace on error.
 
 ### Storage selection
 
@@ -122,7 +129,7 @@ Pick exactly one backend:
 --local <dir>
 
 # Azure Blob Storage (account + key)
---azure-account <account> --azure-container <name> [--azure-prefix <prefix>] --azure-key <key>
+--azure-account <account> --azure-key <key> [--azure-container <name>] [--azure-prefix <prefix>]
 
 # Alternative Azure credentials
 --azure-connection-string <cs>   # or env HBK_AZURE_CONNECTION_STRING
@@ -156,26 +163,25 @@ key (see [Encryption and Compression](#encryption-and-compression)).
 | `rehydrate --version N --file <name> [--execute] [--priority high]` | Determine and rehydrate the exact blob(s) one file needs |
 | `demo` | End-to-end showcase on the local sample |
 | `ls [--prefix p] [--limit N]` | Raw blob listing with sizes/tiers (discovery, no parsing) |
-| `get --blob <repo-path> [--offset O --length L] --out <file>` | Download one blob, optionally a byte range |
+| `get --blob <repo-path> [--offset O --length L] [--out <file>]` | Download one blob, optionally a byte range (offset+length together, else the whole blob) |
 
 Examples:
 
 ```bash
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll info    --local target-azure-azure-nopassword
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll list    --local target-azure-azure-nopassword
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore --local target-azure-azure-nopassword --version 1 --file test.txt
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll ls      --local target-azure-azure-nopassword --limit 50
+hbk info    --local target-azure-azure-nopassword
+hbk list    --local target-azure-azure-nopassword
+hbk restore --local target-azure-azure-nopassword --version 1 --file test.txt
+hbk ls      --local target-azure-azure-nopassword --limit 50
 ```
 
 ### Worked example 1 — local unencrypted sample
 
 ```bash
 # Full end-to-end showcase (overview → list → archive-plan → rehydrate → restore)
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll demo --local target-azure-azure-nopassword
+hbk demo --local target-azure-azure-nopassword
 
 # Restore a single file and verify it
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore \
-  --local target-azure-azure-nopassword --version 1 --file test.txt --out restored/test.txt
+hbk restore --local target-azure-azure-nopassword --version 1 --file test.txt --out restored/test.txt
 ```
 
 ### Worked example 2 — encrypted Azure backup
@@ -186,23 +192,25 @@ the `<account>` / `<container>` placeholders.
 
 ```bash
 # Inspect the backup (format, encryption, versions, whether keys resolved)
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll info \
-  --azure-account <account> --azure-container <container> --azure-prefix synology_1.hbk \
-  --azure-key "$(cat secrets/azure.key)" \
+hbk info \
+  --azure-account <account> --azure-key "$(cat secrets/azure.key)" \
+  --azure-container <container> --azure-prefix synology_1.hbk \
   --rsa-key secrets/private.pem
 
 # Restore one file from the encrypted backup
-dotnet src/HyperBackup.Cli/bin/Debug/net10.0/hbk.dll restore \
-  --azure-account <account> --azure-container <container> --azure-prefix synology_1.hbk \
-  --azure-key "$(cat secrets/azure.key)" \
+hbk restore \
+  --azure-account <account> --azure-key "$(cat secrets/azure.key)" \
+  --azure-container <container> --azure-prefix synology_1.hbk \
   --rsa-key secrets/private.pem \
   --version 1 --file test.txt --out restored/test.txt
 ```
 
 ### Status / limitations
 
-Verified working against **real encrypted cloud backups**, and byte-for-byte
-against an unencrypted backup's original source files:
+Verified against the author's own Synology backups on Azure — one encrypted, one
+unencrypted — with restores checked byte-for-byte against the original source files.
+(The repo also bundles a tiny two-file sample under `target-azure-*/` for offline
+reproduction; the larger figures below come from those real backups, not that sample.)
 
 - `list` (including correctly decrypted filenames),
 - `restore` of **single-chunk, multi-chunk, large, deduplicated, and cross-version
@@ -221,8 +229,9 @@ exact `file_chunk{tier}.index` leaf holding its **ordered chunk list** (one flat
 value, however long — no size cap), and each entry is resolved through `chunk_index`
 to a `(bucket, entry)` and thus a physical chunk. This is authoritative and handles
 deduplicated/non-contiguous files and files that merely share a size. All of these
-indexes are plaintext even in encrypted backups. Coverage measured on the test data:
-**13/13** files in the unencrypted backup and **2,493/2,494** in the encrypted one.
+indexes are plaintext even in encrypted backups. Coverage on those two real backups:
+**13/13** content files resolve in the unencrypted one and **2,493/2,494** in the
+encrypted one.
 
 Remaining gaps:
 
@@ -774,7 +783,7 @@ ID 1 is in use.
 All `.index.2` and `.idx.2` files share a common binary format identified by
 magic bytes `7053 a86e`. All multi-byte integers are **big-endian**.
 
-### Common Header (60 bytes)
+### Common Header (64 bytes, 0x00–0x40)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -782,7 +791,7 @@ magic bytes `7053 a86e`. All multi-byte integers are **big-endian**.
 | `0x04` | 4 | `format_type` | 0=paged record table, 1=B+-tree (TLV nodes), 2=bucket chunk index |
 | `0x08` | 4 | `param_a` | Tree depth (type 0), 0 (type 1), entry_version (type 2) |
 | `0x0C` | 4 | reserved | Always 0 |
-| `0x10` | 4 | `record_size` | Fixed record stride (e.g. 29 for `chunk_index`); 0 when n/a |
+| `0x10` | 4 | `record_size` | Fixed record stride (29 for `chunk_index`, 32 for bucket indexes; 0 when there is no fixed stride) |
 | `0x14` | 4 | reserved | Always 0 |
 | `0x18` | 4 | `declared_size` | Logical file size |
 | `0x1C` | 4 | `flags` | `0x08000000` or `0x09000000` |
@@ -1260,7 +1269,7 @@ The Type 2 binary index format changes slightly when encryption is enabled:
 | Offset | Unencrypted | Encrypted | Meaning |
 |--------|-------------|-----------|---------|
 | `0x1C` (flags) | `0x0800` | `0x0A00` | Bit 1 set = compression+encryption active |
-| `0x2A` | `0x00` | `0x01` | Encryption flag byte |
+| `0x29` | `0x00` | `0x01` | Encryption flag byte (byte `0x28` is `0x01` in both) |
 
 Each encrypted chunk in a `.bucket.2` file has a **4-byte trailing integrity
 tag** appended after the AES ciphertext. This tag is NOT included in the

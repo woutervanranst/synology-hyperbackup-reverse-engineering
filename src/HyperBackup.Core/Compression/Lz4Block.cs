@@ -6,7 +6,7 @@ namespace HyperBackup.Core.Compression;
 /// Decompressor for the LZ4 <b>block</b> format (no frame header), which is what
 /// HyperBackup applies to chunk data when data_compress_type=1 (before AES
 /// encryption). The original/uncompressed size is known from the chunk index
-/// (dedup_size), so the caller passes it as <paramref name="expectedSize"/>.
+/// (dedup_size), so the caller passes it as <c>expectedSize</c>.
 /// Backed by the K4os LZ4 codec.
 /// </summary>
 public static class Lz4Block

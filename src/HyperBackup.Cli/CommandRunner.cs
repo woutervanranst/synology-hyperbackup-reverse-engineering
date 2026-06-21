@@ -436,7 +436,11 @@ public static class CommandRunner
             hbk — Synology HyperBackup cloud-image reader (PoC)
 
             USAGE
-              hbk <command> [storage] [options]
+              dotnet run --project src/HyperBackup.Cli -- <command> [storage] [options]
+              (abbreviated below as: hbk <command> ...)
+
+            GLOBAL OPTIONS
+              --verbose                              print the full stack trace on error
 
             STORAGE (choose one)
               --local <dir>                          a backup folder on disk
@@ -449,7 +453,8 @@ public static class CommandRunner
 
             ENCRYPTION
               --passphrase <p>      backup passphrase (for local-format encKeys.1)
-              --rsa-key <file>      RSA private key exported from the NAS (cloud format)
+              --rsa-key <file>      raw 32-byte X25519 private key exported from the NAS
+                                    (cloud format; despite the flag name it is not RSA)
 
             COMMANDS
               info                                       show format, encryption, versions
@@ -460,6 +465,9 @@ public static class CommandRunner
               rehydrate --version N --file <path> [--execute] [--priority high]
                                                          which blob to rehydrate for a file (task 4)
               demo                                       end-to-end showcase (use with --local)
+              ls [--prefix <p>] [--limit N]              raw blob listing (discovery, no parsing)
+              get --blob <repo-path> [--offset O --length L] [--out f]
+                                                         download one raw blob (for inspection)
 
             EXAMPLES
               hbk info  --local target-azure-azure-nopassword
