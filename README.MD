@@ -211,12 +211,13 @@ Verified working against **real encrypted cloud backups**, and byte-for-byte
 against an unencrypted backup's original source files:
 
 - `list` (including correctly decrypted filenames),
-- `restore` of **single-chunk, multi-chunk, large, and deduplicated files** — e.g. a
-  67 MB / 8,635-chunk file and a non-contiguous PDF that reuses chunks internally,
-  both restored MD5-identical to source; on an encrypted backup, a 9.8 MB /
-  1,251-chunk deduplicated file and split-archive parts of *identical size* each
-  restored to their distinct, correct originals (MD5 + size verified on every
-  restore),
+- `restore` of **single-chunk, multi-chunk, large, deduplicated, and cross-version
+  files** — e.g. a 67 MB / 8,635-chunk file, and after editing it across backup runs
+  an 8,643-chunk version that reuses the unchanged chunks and adds only the new ones,
+  both restored MD5-identical to source; a non-contiguous PDF that reuses chunks
+  internally; on an encrypted backup, a 9.8 MB / 1,251-chunk deduplicated file and
+  split-archive parts of *identical size* each restored to their distinct, correct
+  originals (MD5 + size verified on every restore),
 - `archive-plan`, and
 - per-file `rehydrate` (resolves every bucket a file's chunks span).
 
@@ -231,11 +232,14 @@ indexes are plaintext even in encrypted backups. Coverage measured on the test d
 
 Remaining gaps:
 
-- **Multi-segment chunk lists.** A few files in *churny multi-version* backups store
-  their chunk list in more than one segment (a `count > 1` field in the
-  `virtual_file.index` record); the second segment is placed non-adjacently and is
-  not yet located. Observed on 1 of 2,494 files in the encrypted backup, 0 in the
-  unencrypted one; the size/contiguous fallbacks recover most such cases.
+- **Multi-segment chunk lists.** Exactly 1 of 2,494 files in the encrypted backup has
+  a `virtual_file.index` record with `count = 2` whose chunk list is split into two
+  non-adjacent segments; only the first is located, so the size/contiguous fallbacks
+  must cover it. This appears specific to that one (recreated) backup: deliberately
+  churning files in the unencrypted backup across **four versions** — including a
+  small append to the 67 MB file — never reproduced it (every file came back as a
+  single rewritten leaf, `count = 1`, restored byte-for-byte). So it is not a
+  limitation for normal use; the placement of segment 2 is simply not yet decoded.
 - **Tagless `@AppConfig` system files** (e.g. `_Syno_TaskConfig`) are not restored
   (not user data), though their chunk lists are present in the index.
 - The **file-pool internal segmenting** is only partially understood.
